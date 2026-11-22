@@ -6,7 +6,6 @@ from contextlib import closing
 import pytest
 from telegram.error import BadRequest, TimedOut
 
-from efb_telegram_master import clear_unsendable
 from efb_telegram_master.clear_unsendable import clear
 from efb_telegram_master.db_runtime import postgresql_connection
 from efb_telegram_master.delivery_states import Event, RowState, next_state, ready_sql
@@ -82,13 +81,13 @@ def _rows(directory, database, where="TRUE", columns="*"):
             for row in rows}
 
 
-def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, queue_backend, monkeypatch):
+def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, queue_backend):
     staged = tmp_path / "bot-api"
     staged.mkdir()
-    gone, present, captioned_file, unlisted_file, untexted_file, header_file = (
-        staged / name
-        for name in ("gone.mp4", "present.mp4", "captioned.mp4", "unlisted.mp4", "untexted.mp4", "header.mp4"))
-    for path in (gone, present, captioned_file, unlisted_file, untexted_file, header_file):
+    gone, present, captioned_file, unlisted_file, untexted_file, header_file, resend_file = (
+        staged / name for name in (
+            "gone.mp4", "present.mp4", "captioned.mp4", "unlisted.mp4", "untexted.mp4", "header.mp4", "resend.mp4"))
+    for path in (gone, present, captioned_file, unlisted_file, untexted_file, header_file, resend_file):
         path.write_bytes(b"gif")
     data = tmp_path / "data"
     queue = make_queue(data)
@@ -133,10 +132,14 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
                                         "caption": "<b>Author &amp; co:</b>\n", "parse_mode": "HTML"},
                   cleanup=(str(header_file),))
     after_caption = _add(queue, "send_message", {"chat_id": -1004, "text": "after"}, predecessor=captioned)
+    # A listed send that timed out and still has its file is sent again; an unlisted one (kept_media) stays held.
+    resend = _add(queue, "send_document", {"chat_id": -1005, "document": resend_file.as_uri(), "caption": "again"},
+                  cleanup=(str(resend_file),))
+    after_resend = _add(queue, "send_message", {"chat_id": -1005, "text": "after"}, predecessor=resend)
     for row_id, error in ((gone_media, TimedOut()), (rejected, BadRequest("Message is too long")),
                           (edit, TimedOut()), (source, TimedOut()), (kept_media, TimedOut()),
                           (captioned, TimedOut()), (unlisted, TimedOut()), (placeholder, TimedOut()),
-                          (header, TimedOut())):
+                          (header, TimedOut()), (resend, TimedOut())):
         _hold(queue, row_id, error)
     _copy_payload(queue, source, rejected)  # A removed row and a kept row name one file.
     for path in (gone, captioned_file, unlisted_file, untexted_file, header_file):
@@ -145,45 +148,40 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
     before = _rows(data, queue_backend)
     unchanged = "priority, telegram_chat_id, slave_id, created_at, log_context, predecessor_id, thread_id"
     before_unchanged = _rows(data, queue_backend, columns=unchanged)[captioned]
+    stored = unchanged + ", operation, payload, required_sender_bot_id"
+    before_resend = _rows(data, queue_backend, columns=stored)[resend]
+    # While their predecessors are held, nothing defers the rows behind them.
+    assert {after_caption, after_resend} <= set(_rows(data, queue_backend, ready_sql("q")))
     files = set(queue.media_dir.iterdir())
 
     # Without a list of rows not delivered, no caption is sent: every gone-file row is removed.
     report = clear(data, database=queue_backend)
     assert report["removed"] == {"missing_media": 5, "rejected_batch": 1, "needs_removed_row": 1}
     assert report["caption_sent_as_text"] == 0 and report["caption_not_sent"] == 4 and report["released"] == 5
-    assert report["caption_header_only"] == 0 and report["media_files_removed"] == 2 and not report["applied"]
+    assert report["caption_header_only"] == 0 and report["resend"] == 0
+    assert report["media_files_removed"] == 2 and not report["applied"]
     assert _rows(data, queue_backend) == before and set(queue.media_dir.iterdir()) == files
 
+    # A listed caption is sent unless it is only the sender's header; a listed rejected batch is still removed.
     listed = tmp_path / "not-delivered.txt"
-    listed.write_text(f"{captioned}\n{placeholder}\n{header}\n")
-    # While a caption that is only the sender's header is not sent, that listed row is removed.
-    monkeypatch.setattr(clear_unsendable, "SEND_HEADER_ONLY_CAPTIONS", False)
-    report = clear(data, database=queue_backend, not_delivered=listed)
-    assert report["removed"] == {"missing_media": 3, "rejected_batch": 1, "needs_removed_row": 1}
-    assert report["caption_sent_as_text"] == 2 and report["caption_not_sent"] == 2
-    assert report["caption_header_only"] == 1
-    assert _rows(data, queue_backend) == before and set(queue.media_dir.iterdir()) == files
-    monkeypatch.undo()
-
-    # Every listed caption is sent, a header alone included; a captioned row that is not listed is removed.
+    listed.write_text(f"{captioned}\n{placeholder}\n{header}\n{resend}\n{rejected}\n")
     report = clear(data, apply=True, database=queue_backend, not_delivered=listed)
-    assert report["removed"] == {"missing_media": 2, "rejected_batch": 1, "needs_removed_row": 1}
-    assert report["caption_sent_as_text"] == 3 and report["caption_not_sent"] == 1
-    assert report["caption_header_only"] == 1
-    assert report["kept"] == 10 and report["released"] == 4 and report["media_files_removed"] == 2
+    assert report["removed"] == {"missing_media": 3, "rejected_batch": 1, "needs_removed_row": 1}
+    assert report["caption_sent_as_text"] == 2 and report["caption_not_sent"] == 1
+    assert report["caption_header_only"] == 1 and report["resend"] == 1
+    assert report["kept"] == 11 and report["released"] == 4 and report["media_files_removed"] == 2
     # Only the files of the removed row and of the converted row went; the file a kept row still names stays.
     assert len(files - set(queue.media_dir.iterdir())) == 2 and present.exists()
-    removed, converted = {gone_media, rejected, update, unlisted}, {captioned, placeholder, header}
+    removed, converted = {gone_media, rejected, update, unlisted, header}, {captioned, placeholder}
     rows = _rows(data, queue_backend)
-    assert all(rows.pop(row_id) != before[row_id] for row_id in converted)
-    assert rows == {row_id: row for row_id, row in before.items() if row_id not in removed | converted}
-    # Once the caption is a send again, the row behind it waits for it.
+    assert all(rows.pop(row_id) != before[row_id] for row_id in converted | {resend})
+    assert rows == {row_id: row for row_id, row in before.items() if row_id not in removed | converted | {resend}}
+    # The row sent again keeps its request and is unheld; rows behind it and behind a caption wait for them.
+    assert _rows(data, queue_backend, columns=stored)[resend] == before_resend
     ready = set(_rows(data, queue_backend, ready_sql("q")))
-    assert ready == {append, behind, kept_text, *converted} and after_caption not in ready
-    sent = _rows(data, queue_backend, f"id IN ({placeholder}, {header})", "operation, payload")
-    assert {row_id: (operation, pickle.loads(payload[1:])[1]["text"])
-            for row_id, (operation, payload) in sent.items()} == {
-        placeholder: ("send_message", "<b>Author:</b>\n🖼️"), header: ("send_message", "<b>Author &amp; co:</b>\n")}
+    assert ready == {append, behind, kept_text, resend, *converted}
+    sent = _rows(data, queue_backend, f"id = {placeholder}", "operation, payload")[placeholder]
+    assert (sent[0], pickle.loads(sent[1][1:])[1]["text"]) == ("send_message", "<b>Author:</b>\n🖼️")
     # The same chat, topic, text and formatting, without the video, from the bot that attempted it, in its place.
     assert _rows(data, queue_backend, columns=unchanged)[captioned] == before_unchanged
     operation, payload, sender = _rows(data, queue_backend, columns="operation, payload, required_sender_bot_id")[
