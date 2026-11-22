@@ -191,8 +191,8 @@ While the bot runs, only `/confirm_send` ends a hold (and startup, for the
 clears only `history_failed:RequiredSenderUnavailableError` on a history row
 that never started an attempt). The bot never removes a held row or its media by
 itself. A held row that can never be sent is cleared offline: it is removed, or,
-when its media file is gone but its message had text and it was not delivered,
-it becomes a text send of its caption:
+when its media file is gone but it has a caption and it was not delivered, it
+becomes a text send of its caption:
 
 ```sh
 python -m efb_telegram_master.clear_unsendable --data-dir /channel/data
@@ -208,8 +208,8 @@ when it runs. These rows are removed:
 
 | Reason | Row |
 |---|---|
-| `missing_media` | Held; an external media file it names (a local path or `file://` URI, such as a file staged for a local Bot API server) is gone. Web URLs are fetched again on replay and do not count. A listed row whose message had text sends its caption instead (below). |
-| `missing_sidecar` | Held; a queue-owned file it names in `outbound-media/` is gone. A listed row whose message had text sends its caption instead (below). |
+| `missing_media` | Held; an external media file it names (a local path or `file://` URI, such as a file staged for a local Bot API server) is gone. Web URLs are fetched again on replay and do not count. A listed row with a caption sends its caption instead (below). |
+| `missing_sidecar` | Held; a queue-owned file it names in `outbound-media/` is gone. A listed row with a caption sends its caption instead (below). |
 | `invalid_payload` | Held as `invalid_payload`. |
 | `rejected_batch` | Held as `aggregation_failed:BadRequest`: Telegram rejected the batch. |
 | `needs_removed_row` | Held or waiting edit of a container that does not exist yet (a `member_update` without `container_id`, see [Ordering links](#ordering-links)): the removed row would have created it. Repeated for edits that wait on such an edit in turn. |
@@ -218,17 +218,22 @@ when it runs. These rows are removed:
 rows found not delivered, checked against the chat just before the clear. The
 tool itself does not look in the chat. A held send of one media file
 (`send_photo`, `send_video`, `send_document` and the like) whose file is gone,
-whose message had text and whose id is in that file is not removed: it becomes a
+that has a caption and whose id is in that file is not removed: it becomes a
 text send of its caption (`caption_sent_as_text`). Every other row whose file is
 gone is removed, including a delivered one, whose caption is already in the
-chat; such a removed row whose message had text is also counted as
-`caption_not_sent`. Without `--not-delivered`, no caption is sent, every row
-whose file is gone is removed, and the output says so. Ids in the file that do
-not name such a row change nothing.
+chat; such a removed row with a caption is also counted as `caption_not_sent`.
+Without `--not-delivered`, no caption is sent, every row whose file is gone is
+removed, and the output says so. Ids in the file that do not name such a row
+change nothing.
 
-A stored caption usually starts with the sender's name and shows only a
-placeholder for a message without text, so whether the message had text is read
-from the row's MsgLog context; a row without one counts by its stored caption.
+A stored caption starts with the sender's header line, which ends in `:`. For a
+message without text, the header is followed by a placeholder line or by
+nothing. A caption that is only that header (one short line ending in `:`,
+ignoring formatting) is counted as `caption_header_only` when its row is
+listed. Such a caption is sent like any other while `SEND_HEADER_ONLY_CAPTIONS`
+in `clear_unsendable.py` is true, the default; when it is false, a listed row
+with only a header is removed and counted as `caption_not_sent`. There is no
+command-line option for it.
 A row that sends its caption keeps its id, chat, topic, position and MsgLog
 context; its request becomes `send_message` with the caption as `text` and the
 caption's formatting, reply and buttons, without the file or the options only
@@ -250,7 +255,8 @@ that now sends only its caption, is deleted when no remaining row names it;
 while any remaining row's media cannot be read, all files are kept. External
 media files are never deleted. The output has counts only: all rows, removed
 rows by reason and by operation, rows whose caption is sent as text, removed
-rows whose caption is not sent, kept rows (including those sending a caption),
+rows whose caption is not sent, listed rows whose caption is only the header,
+kept rows (including those sending a caption),
 kept rows that were ordered behind a removed row (`released`), and deleted
 files. To undo `--apply`, restore the queue (`outbound-queue.sqlite3` and
 `outbound-media/`, or the PostgreSQL queue tables) from a backup taken before
@@ -278,7 +284,7 @@ below lists only events on an existing row.
 | remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
 | discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
-| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send of a message with text whose file is gone (above) |
+| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send with a caption whose file is gone (above) |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is

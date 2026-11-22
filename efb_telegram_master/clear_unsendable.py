@@ -4,7 +4,7 @@ Run only while EFB is stopped. Without --apply, this only reports counts.
 A held row is removed when its stored request can no longer be sent: its
 external media file is gone, its queue-owned media file is gone, its request
 cannot be decoded, or Telegram rejected its aggregated batch (BadRequest).
-A held send whose media file is gone, whose message has text and whose id is
+A held send whose media file is gone, that has a caption and whose id is
 listed in the --not-delivered file (one row id per line, the rows found not
 delivered) is not removed: it becomes a text send of its caption, to the same
 chat and topic, from the bot that attempted it, which the bot sends on its next
@@ -17,8 +17,10 @@ pass the same ``database`` settings the bot uses (``--config``).
 """
 import argparse
 import fcntl
+import html
 import inspect
 import pickle
+import re
 import sqlite3
 import time
 from collections import Counter, defaultdict
@@ -39,7 +41,7 @@ from .outbound import (
     SUPPLEMENTAL_KEY,
     OutboundQueue,
 )
-from .queued_log import decode, decode_aggregation
+from .queued_log import decode_aggregation
 
 # Why a row is removed; only these names and their counts are reported.
 MISSING_MEDIA = "missing_media"            # external media file gone
@@ -84,26 +86,22 @@ def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str 
     return None
 
 
-def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) -> bytes | None:
-    """The request that sends a gone media file's caption as text, or None to remove the row.
+def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) -> tuple[bytes, bool] | None:
+    """The request that sends a gone media file's caption as text and whether
+    that caption is only the sender's header; None to remove the row.
 
     A caption is kept for a send of one media file, alone or between text
-    batches, whose message has text. A stored caption usually starts with the
-    sender's name and shows a placeholder when the message has no text, so a
-    message without text is removed. A member of a text batch is built again
-    from its batch when sent, and a full-content attachment's caption only
-    announces the file: both are removed too.
+    batches. A member of a text batch is built again from its batch when sent,
+    and a full-content attachment's caption only announces the file: both are
+    removed.
     """
     if not operation.startswith("send_") or operation not in _DIRECT_MEDIA_ARGUMENTS:
         return None
     try:
         context = None if log_context is None else decode_aggregation(log_context)
-        if context is not None and context.get("kind") != ContextKind.BOUNDARY:
-            return None
-        message = context["legacy_context"] if context is not None else log_context
-        if message is not None and not (decode(message)[0].text or "").strip():
-            return None
     except Exception:  # noqa: BLE001 - unpickling a damaged context can raise anything
+        return None
+    if context is not None and context.get("kind") != ContextKind.BOUNDARY:
         return None
     args, kwargs = pickle.loads(payload[1:])
     if not isinstance(kwargs.get("caption"), str) or not kwargs["caption"].strip() or kwargs.get(SUPPLEMENTAL_KEY):
@@ -116,7 +114,7 @@ def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) 
         # The media file and media-only options go; queue metadata stays.
         if key != "self" and (name in _TEXT_PARAMETERS or key not in media_parameters):
             request[name] = value
-    return OutboundQueue.encode_payload((), request)
+    return OutboundQueue.encode_payload((), request), _header_only(kwargs["caption"], kwargs.get("parse_mode"))
 
 
 def _references(run: Callable, row_id: int, version: bytes, size: int):
@@ -134,13 +132,33 @@ def _references(run: Callable, row_id: int, version: bytes, size: int):
     return references
 
 
+# Whether a listed row whose caption is only the sender's header sends that
+# header as text (True) or is removed like an unlisted row (False).
+SEND_HEADER_ONLY_CAPTIONS = True
+_HTML_TAG = re.compile(r"<[^>]*>")
+
+
+def _header_only(caption: str, parse_mode: object) -> bool:
+    """Whether a caption is only the sender's header: one short line ending in ':'.
+
+    A message without text is stored with the header alone or the header and
+    a placeholder line; only the first is header-only.
+    """
+    if str(parse_mode).lower() == "html":
+        caption = html.unescape(_HTML_TAG.sub("", caption))
+    caption = caption.strip()
+    return "\n" not in caption and caption.endswith(":") and len(caption) <= 80
+
+
 def _clear(
     run: Callable, media_dir: Path, not_delivered: frozenset[int],
 ) -> tuple[dict[int, str], dict[int, tuple], dict, set[str]]:
     """Decide which rows go and which send their caption as text instead.
 
-    Only a row in ``not_delivered`` sends its caption. Returns (row id -> reason, row id -> new request and sender, report counts,
-    sidecar names to delete).
+    Only a row in ``not_delivered`` sends its caption, and one whose caption is
+    only the sender's header only while ``SEND_HEADER_ONLY_CAPTIONS``. Returns
+    (row id -> reason, row id -> new request and sender, report counts, sidecar
+    names to delete).
     """
     now = time.time()
     states: dict[int, RowState] = {}
@@ -152,6 +170,7 @@ def _clear(
     removed: dict[int, str] = {}
     captions: dict[int, tuple[bytes, str]] = {}
     unsent = 0  # Captions of removed rows.
+    header_only = 0  # Listed rows whose caption is only the sender's header.
     for row_id, operation, state, hold, reconcile_after, predecessor, version, size, required, attempted in run(
         "SELECT id, operation, delivery_state, delivery_hold, reconcile_after, predecessor_id, "
         "substr(payload, 1, 1), length(payload), required_sender_bot_id, attempt_sender_bot_id "
@@ -169,15 +188,18 @@ def _clear(
             sidecars[row_id] = {item.storage_name for item in references if item.storage_name is not None}
         if next_state(current, Event.DISCARD) is not None:
             reason = _unsendable(current, hold, references, media_dir)
-            text = None
+            caption = None
             if reason in _GONE_FILE and next_state(current, Event.REPLACE_REQUEST) is not None:
                 payload, log_context = run("SELECT payload, log_context FROM outbound_queue WHERE id=?", (row_id,))[0]
-                text = _caption_as_text(operation, bytes(payload), None if log_context is None else bytes(log_context))
-            if text is not None and row_id in not_delivered:
+                caption = _caption_as_text(
+                    operation, bytes(payload), None if log_context is None else bytes(log_context))
+            listed = caption is not None and row_id in not_delivered
+            header_only += listed and caption[1]
+            if listed and (SEND_HEADER_ONLY_CAPTIONS or not caption[1]):
                 # The same bot sends the caption; a row ordered behind it waits for it.
-                captions[row_id] = (text, required or attempted or "__main__")
+                captions[row_id] = (caption[0], required or attempted or "__main__")
             elif reason is not None:
-                unsent += text is not None
+                unsent += caption is not None
                 removed[row_id] = reason
 
     pending = list(removed)
@@ -207,8 +229,10 @@ def _clear(
         "removed": dict(Counter(removed.values())),
         "removed_by_operation": dict(Counter(operations[row_id] for row_id in removed)),
         "caption_sent_as_text": len(captions),
-        # Removed rows whose message had text: not listed as not delivered.
+        # Removed rows with a caption: not listed as not delivered (or only a header, when those are not sent).
         "caption_not_sent": unsent,
+        # Listed rows whose caption is only the sender's header, sent or not.
+        "caption_header_only": header_only,
         "kept": len(kept),
         # Kept rows that were ordered behind a removed row; nothing defers them now.
         "released": sum(1 for row_id in kept if predecessors.get(row_id) in removed),
@@ -283,8 +307,8 @@ def clear(
     """Report, and with ``apply`` remove, the rows that can never be sent.
 
     ``not_delivered`` is a file of row ids, one per line, found not delivered.
-    A row whose media file is gone, whose message has text and whose id is in
-    it is not removed: it becomes a text send of its caption. Without the file
+    A row whose media file is gone, that has a caption and whose id is in it
+    is not removed: it becomes a text send of its caption. Without the file
     no caption is sent. ``database`` is ETM's ``database`` setting; the rows
     are read from the queue of that backend. Queue-owned media files of
     removed rows, and of rows that now send only their caption, are deleted
