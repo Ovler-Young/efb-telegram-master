@@ -66,13 +66,14 @@ class ReadState(Enum):
     CLOSED = "closed"   # up to a message dated after the window, or up to a logged later message
     CAPPED = "capped"   # RANGE_CAP ids read without closing
     OPEN = "open"       # the chat ended before a later message was seen
+    UNTRUSTED = "untrusted"   # the chat does not confirm a logged message bounding the span
 
 
 # --------------------------------------------------------------------------- what a row and a message are
 KIND_OF_OPERATION = {
     "send_message": "text", "send_photo": "photo", "send_animation": "animation", "send_video": "video",
     "send_document": "document", "send_sticker": "sticker", "send_audio": "audio", "send_voice": "voice",
-    "edit_message_text": "edit", "edit_message_caption": "edit",
+    "edit_message_text": "edit",
 }
 # What Telegram may turn a send into: an animation is delivered as a video or document, and so on.
 COMPATIBLE = {
@@ -142,7 +143,6 @@ class Seen:
     length: int
     thread: int | None
     forwarded: bool
-    edited: bool
     message: Any = field(repr=False, compare=False)
 
     @classmethod
@@ -172,13 +172,14 @@ class Seen:
             kind = "other"
         text = _normalize(message.message, False)
         reply = message.reply_to
-        top = getattr(reply, "reply_to_top_id", None) if reply else None
-        direct = getattr(reply, "reply_to_msg_id", None) if reply else None
-        thread = top or (direct if reply and getattr(reply, "forum_topic", False) else None)
+        # Only a forum topic is a topic: outside a forum a reply to a reply also names the top of its chain.
+        thread = None
+        if reply is not None and getattr(reply, "forum_topic", False):
+            thread = getattr(reply, "reply_to_top_id", None) or getattr(reply, "reply_to_msg_id", None)
         return cls(
             id=message.id, date=message.date.timestamp(), author=getattr(message.from_id, "user_id", None),
             kind=kind, file_name=file_name, digest=_digest(text), length=len(text), thread=thread,
-            forwarded=message.fwd_from is not None, edited=message.edit_date is not None, message=message,
+            forwarded=message.fwd_from is not None, message=message,
         )
 
 
@@ -245,14 +246,12 @@ def _thread_ok(keys: RowKeys, seen: Seen) -> bool:
         seen.thread if seen.thread not in (None, 0, 1) else None)
 
 
-def _text_match(keys: RowKeys, seen: Seen) -> bool | str:
-    """True for a text or caption match, "weak" when the message was edited since, else False."""
+def _text_match(keys: RowKeys, seen: Seen) -> bool:
+    """The same text or caption, or the start of a caption Telegram cut."""
     if seen.digest == keys.digest and seen.length == len(keys.text):
         return True
     cut = keys.kind != "text" and MIN_PREFIX <= seen.length < len(keys.text)
-    if cut and _digest(keys.text[:seen.length]) == seen.digest:
-        return True           # a caption Telegram cut
-    return "weak" if seen.edited else False
+    return cut and _digest(keys.text[:seen.length]) == seen.digest
 
 
 def _in_window(keys: RowKeys, seen: Seen) -> bool:
@@ -266,23 +265,20 @@ def _visible(keys: RowKeys, span: Span, chat: Mapping[int, Seen]):
             yield seen
 
 
-def _candidates(keys, span, chat, logged) -> list[tuple[Seen, bool]]:
-    found = []
-    for seen in _visible(keys, span, chat):
-        if seen.kind not in COMPATIBLE[keys.kind] or not _in_window(keys, seen) or not _thread_ok(keys, seen):
-            continue
-        match = _text_match(keys, seen)
-        if match and not logged(keys.chat_id, seen.id):
-            found.append((seen, match is True))
-    strong = [item for item in found if item[1]]
-    found = strong or found
+def _candidates(keys, span, chat, logged) -> list[Seen]:
+    found = [
+        seen for seen in _visible(keys, span, chat)
+        if seen.kind in COMPATIBLE[keys.kind] and _in_window(keys, seen) and _thread_ok(keys, seen)
+        and _text_match(keys, seen) and not logged(keys.chat_id, seen.id)
+    ]
     if keys.file_name:
-        found = [item for item in found if item[0].file_name == keys.file_name] or found
+        found = [seen for seen in found if seen.file_name == keys.file_name] or found
     return found
 
 
 def _near_miss(keys, span, chat, logged) -> bool:
-    """A same-bot, same-kind, same-topic, same-time message that is not logged but has other text."""
+    """A same-bot, same-kind, same-topic, same-time message that is not logged but has other text (it may have
+    been edited since)."""
     return any(
         seen.kind in COMPATIBLE[keys.kind] and _in_window(keys, seen) and _thread_ok(keys, seen)
         and not logged(keys.chat_id, seen.id)
@@ -360,29 +356,23 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
             # A not applied edit carries the message it changes: a later edit date shows a newer edit.
             out[keys.id] = Decision(Verdict.FOUND if index <= applied else Verdict.NOT_FOUND, message)
 
-    deferred = []
     contenders: list[tuple[list[RowKeys], dict[int, list[Seen]]]] = []
-    early_ids: set[int] = set()
-    early_weak: set[tuple[int, int]] = set()   # edited messages a recent cluster may own
+    waiting: set[int] = set()   # rows decided on a later pass or not at all, which still hold their messages
     for cluster in _clusters(sends):
         early = any(too_early(keys.attempt, now) for keys in cluster)
-        if early:
-            out.update({keys.id: Decision(Verdict.TOO_EARLY) for keys in cluster})
+        untrusted = not early and any(spans[keys.id].state is ReadState.UNTRUSTED for keys in cluster)
+        if early or untrusted:
+            verdict = Verdict.TOO_EARLY if early else Verdict.AMBIGUOUS
+            out.update({keys.id: Decision(verdict) for keys in cluster})
             if not all(keys.id in spans for keys in cluster):
                 continue
         chat = seen.get(cluster[0].chat_id, {})
-        found = {keys.id: _candidates(keys, spans[keys.id], chat, logged) for keys in cluster}
-        strong = {keys.id: [s for s, is_strong in found[keys.id] if is_strong] for keys in cluster}
-        if any(strong.values()):
-            contenders.append((cluster, strong))
-            if early:
-                early_ids.update(keys.id for keys in cluster)
-        elif early:
-            early_weak.update((keys.chat_id, s.id) for keys in cluster for s, _ in found[keys.id])
-            continue
-        elif any(found.values()):
-            deferred.append((cluster, {keys.id: [s for s, _ in found[keys.id]] for keys in cluster}))
-        else:
+        pools = {keys.id: _candidates(keys, spans[keys.id], chat, logged) for keys in cluster}
+        if any(pools.values()):
+            contenders.append((cluster, pools))
+            if early or untrusted:
+                waiting.update(keys.id for keys in cluster)
+        elif not (early or untrusted):
             for keys in cluster:
                 out[keys.id] = Decision(_missing(keys, spans[keys.id], chat, logged))
 
@@ -401,21 +391,8 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
     for members, pools, _ in groups:
         taken = _assign(members, pools)
         for keys in members:
-            if keys.id in early_ids:   # a recent cluster is decided on a later pass, but it still holds its messages
+            if keys.id in waiting:
                 continue
-            out[keys.id] = Decision(Verdict.FOUND, taken[keys.id]) if taken else Decision(Verdict.AMBIGUOUS)
-    taken_by_strong = set().union(*(group[2] for group in groups))
-
-    # A message edited since it was sent matches only on its other keys, so it may belong to one cluster only
-    # and not to a cluster that matched it on its text.
-    claims = collections.Counter((cluster[0].chat_id, s.id) for cluster, pools in deferred
-                                 for pool in pools.values() for s in pool)
-    for cluster, pools in deferred:
-        contested = any(claims[(cluster[0].chat_id, s.id)] > 1 or (cluster[0].chat_id, s.id) in taken_by_strong
-                        or (cluster[0].chat_id, s.id) in early_weak
-                        for pool in pools.values() for s in pool)
-        taken = None if contested or not all(pools.values()) else _assign(cluster, pools)
-        for keys in cluster:
             out[keys.id] = Decision(Verdict.FOUND, taken[keys.id]) if taken else Decision(Verdict.AMBIGUOUS)
     return out
 
@@ -625,19 +602,15 @@ class HeldSendCheck:
             self._readers[bot] = BotReader(self._tokens[bot], *self._api, client_factory=self._factory)
         return self._readers[bot]
 
-    def _span(self, row: HeldRow, keys: RowKeys) -> tuple[int, int | None, bool] | None:
-        """(first id, last id or None, exact) to read for a send; None when it cannot be placed."""
+    def _bounds(self, row: HeldRow, keys: RowKeys) -> tuple[int | None, int | None] | None:
+        """The ids logged for the row's source chat before the attempt and after the window; None when neither."""
         if row.slave_id is None:
             return None
         before, after = self._db.logged_id_bounds(
             row.slave_id, row.chat_id,
             datetime.datetime.fromtimestamp(keys.attempt - PRE),
             datetime.datetime.fromtimestamp(keys.attempt + WINDOW + AFTER_SLACK))
-        if before is None and after is None:
-            return None
-        if before is None:
-            return max(1, after - RANGE_CAP), after - 1, False
-        return before + 1, None if after is None else after - 1, True
+        return None if before is None and after is None else (before, after)
 
     @staticmethod
     async def _read(reader: BotReader, store, asked, chat_id: int, ids: Sequence[int]) -> None:
@@ -647,23 +620,47 @@ class HeldSendCheck:
             store[chat_id].update(await reader.messages(chat_id, missing))
             asked[chat_id].update(missing)
 
-    async def _fill(self, reader: BotReader, store, asked, keys: RowKeys, first: int, last: int | None,
-                    exact: bool) -> Span:
-        """Read upward from ``first`` until a message after the window is seen, ``last`` or the cap is reached."""
+    async def _fill(self, reader: BotReader, store, asked, keys: RowKeys, before: int | None,
+                    after: int | None) -> Span:
+        """Read the ids between the logged messages ``before`` and ``after``, upward until a message after the
+        window is seen, ``after`` or the cap is reached. Without ``before`` the span ends at ``after`` and may
+        begin after the message.
+
+        The log orders messages by the time each entry was written, and a late entry (a confirmation, a
+        combined message sent late) can carry an id out of place. So both logged messages are read too, and
+        the span is ``UNTRUSTED`` unless the chat shows ``before`` dated by the attempt and ``after`` dated
+        after the window, in that id order."""
+        last: int | None
+        if before is None:
+            assert after is not None
+            first, last, exact = max(1, after - RANGE_CAP), after - 1, False
+        else:
+            first, last, exact = before + 1, None if after is None else after - 1, True
         chat = store[keys.chat_id]
+        neighbours = [i for i in (before, after) if i is not None]
         high = first + RANGE_CAP - 1 if last is None else min(last, first + RANGE_CAP - 1)
         window_end = keys.attempt + WINDOW
+        state = ReadState.CLOSED if last is not None and high == last else ReadState.CAPPED
         cursor = first
         while cursor <= high:
-            batch = range(cursor, min(cursor + BATCH, high + 1))
-            await self._read(reader, store, asked, keys.chat_id, batch)
+            extra = [i for i in neighbours if i not in asked[keys.chat_id]]
+            batch = range(cursor, min(cursor + BATCH - len(extra), high + 1))
+            await self._read(reader, store, asked, keys.chat_id, [*extra, *batch])
             visible = [chat[i] for i in batch if i in chat]
             if any(seen.date > window_end for seen in visible):
-                return Span(first, batch[-1], ReadState.CLOSED, exact)
+                high, state = batch[-1], ReadState.CLOSED
+                break
             if last is None and not visible:
-                return Span(first, batch[-1], ReadState.OPEN, exact)
+                high, state = batch[-1], ReadState.OPEN
+                break
             cursor = batch[-1] + 1
-        state = ReadState.CLOSED if last is not None and high == last else ReadState.CAPPED
+        await self._read(reader, store, asked, keys.chat_id, neighbours)
+        lower = chat.get(before) if before is not None else None
+        upper = chat.get(after) if after is not None else None
+        if ((before is not None and (lower is None or lower.date > keys.attempt))
+                or (after is not None and (upper is None or upper.date <= window_end))
+                or (before is not None and after is not None and after <= before)):
+            state = ReadState.UNTRUSTED
         return Span(first, high, state, exact)
 
     async def _check_bot(self, bot: str | None, held: list[HeldRow]) -> collections.Counter:
@@ -712,16 +709,20 @@ class HeldSendCheck:
                 else:
                     usable.extend(group)
                 continue
-            placed = [self._span(keyed[keys.id][0], keys) for keys in group]
+            placed = [self._bounds(keyed[keys.id][0], keys) for keys in group]
             located = [where for where in placed if where is not None]
             if len(located) < len(placed):
                 counts["no_neighbours"] += 1
+                continue
+            if group[0].chat_id in unreadable_chats:
+                counts["chat_unreadable"] += 1
                 continue
             try:
                 for keys, where in zip(group, located, strict=True):
                     spans[keys.id] = await self._fill(reader, store, asked, keys, *where)
             except ChatUnreadable:
                 counts["chat_unreadable"] += 1
+                unreadable_chats.add(group[0].chat_id)
             else:
                 usable.extend(group)
         decisions = decide(usable, spans, store, self._db.is_message_logged, now)
@@ -883,8 +884,8 @@ def report_not_delivered(data_dir: Path | str, out_path: Path | str, *, api_id: 
 
     One read-only pass over every held send of the channel in ``data_dir`` (the bot tokens and the database
     settings come from its ``config.yaml``, the way the bot reads them). Prints counts only. Returns 0 when
-    every bot could read; 1, with no file written, when a bot could not log in. A row the chat does not decide
-    (ambiguous, too recent, unreadable) is not listed.
+    every bot could read; 1, with no file written, when the pass of a bot failed (a login or a read). A row
+    the chat does not decide (ambiguous, too recent, unreadable) is not listed.
     """
     directory = Path(data_dir).resolve()
     config = _read_config(directory)

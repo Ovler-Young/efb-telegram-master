@@ -2088,7 +2088,8 @@ class TelegramBotManager(LocaleMixin):
         """Apply what the chat shows about a held send; False when the row is left held.
 
         Found: the message is recorded as the delivery, as ``/confirm_send`` does; nothing is sent.
-        Not found: sent again when its attempt is recent and its media is all there, else discarded.
+        Not found: sent again when its attempt is recent and its media is all there, else discarded. A row
+        sent again this way is not sent a third time: when it is missing again it stays held.
         """
         if verdict is Verdict.FOUND:
             assert seen is not None
@@ -2103,13 +2104,18 @@ class TelegramBotManager(LocaleMixin):
                 return False
             with queue._lock:
                 row = queue.connection.execute(
-                    "SELECT telegram_chat_id, operation, payload, attempt_started_at, delivery_state, delivery_hold "
-                    "FROM outbound_queue WHERE id=?", (row_id,),
+                    "SELECT operation, payload, attempt_started_at, delivery_state, delivery_hold, log_context, "
+                    "unconfirmed_at FROM outbound_queue WHERE id=?", (row_id,),
                 ).fetchone()
-            if row is None or classify(row[4], row[5]) is not RowState.UNCERTAIN:
+            if row is None or classify(row[3], row[4]) is not RowState.UNCERTAIN:
                 return False  # resolved meanwhile
-            chat_id, operation, payload, attempt_started_at = row[:4]
-            if self._may_resend(row_id, chat_id, operation, payload, attempt_started_at, seen):
+            operation, payload, attempt_started_at, _state, _hold, log_context, unconfirmed_at = row
+            if unconfirmed_at is not None:
+                return False  # an earlier try was not confirmed either
+            action = self._not_delivered_action(row_id, operation, payload, attempt_started_at, log_context, seen)
+            if action == "hold":
+                return False
+            if action == "resend":
                 queue.resend_uncertain(row_id)
                 scheduler.wake_event.set()
                 return True
@@ -2124,40 +2130,33 @@ class TelegramBotManager(LocaleMixin):
             scheduler.wake_event.set()
         return True
 
-    def _may_resend(self, row_id: int, chat_id: int, operation: str, payload: bytes,
-                    attempt_started_at: float | None, target: Seen | None) -> bool:
-        """Whether a held send its chat lacks is sent again rather than discarded."""
+    def _not_delivered_action(self, row_id: int, operation: str, payload: bytes, attempt_started_at: float | None,
+                              log_context: bytes | None, target: Seen | None) -> Literal["resend", "discard", "hold"]:
+        """What happens to a held send its chat lacks: sent again, discarded, or left held."""
         if attempt_started_at is None or time.time() - attempt_started_at >= HELD_RESEND_SECONDS:
-            return False
+            return "discard"
         try:
             args, kwargs = OutboundQueue.decode_payload_raw(bytes(payload))
         except InvalidQueuedPayloadError:
-            return False
+            return "discard"
         references: list = []
         OutboundQueue._collect_media_references((args, kwargs), references)
         if missing_media(references, self._outbound_queue.media_dir) is not None:
-            return False
-        if not operation.startswith("edit_message_"):
-            return True
-        # An edit is dropped when a newer edit of the same message was sent or is queued.
+            return "discard"
+        if operation not in EDIT_OPERATIONS:
+            return "resend"
+        from .queued_log import decode_aggregation
+        context = decode_aggregation(bytes(log_context)) if log_context else None
+        appends = bool(context and context.get("members"))
+        newer = self._outbound_queue.unconfirmed_edit_superseded(row_id) is not None
+        # A message edited after the attempt was edited again since. A combined message is also changed by
+        # its later updates, which are not newer edits, so this tells only for a standalone message.
         edited_at = target.message.edit_date if target is not None else None
-        if edited_at is not None and edited_at.timestamp() > attempt_started_at:
-            return False
-        queue = self._outbound_queue
-        with queue._lock:
-            later = queue.connection.execute(
-                "SELECT operation, payload FROM outbound_queue WHERE telegram_chat_id=? AND id>?", (chat_id, row_id),
-            ).fetchall()
-        for later_operation, later_payload in later:
-            if not later_operation.startswith("edit_message_"):
-                continue
-            try:
-                _args, later_kwargs = OutboundQueue.decode_payload_raw(bytes(later_payload))
-            except InvalidQueuedPayloadError:
-                continue
-            if later_kwargs.get("message_id") == kwargs.get("message_id"):
-                return False
-        return True
+        newer = newer or (not appends and edited_at is not None and edited_at.timestamp() > attempt_started_at)
+        if not newer:
+            return "resend"
+        # An edit that appends messages to a combined message is their only copy: it is not dropped.
+        return "hold" if appends else "discard"
 
     def record_queued_success(
         self, row, result: object, selection: SenderSelection

@@ -3137,12 +3137,18 @@ class OutboundQueue:
                        format_hold(HoldKind.HISTORY_FAILED, error_detail(error)), telegram_error_text(error))
 
     def resend_uncertain(self, row_id: int) -> None:
-        """Send an uncertain row again: its chat shows it never arrived. Only the hold is cleared."""
+        """Send an uncertain row again: its chat shows it never arrived.
+
+        The hold and its error text are cleared, and ``unconfirmed_at`` records
+        that Telegram did not confirm the earlier try, so the row is sent again
+        this way only once.
+        """
         with self._lock, self.connection:
             self._transition(row_id, Event.RESEND, dependents=True)
             cursor = self.connection.execute(
-                "UPDATE outbound_queue SET delivery_hold=NULL WHERE id=? AND delivery_state=? AND delivery_hold LIKE ?",
-                (row_id, QUEUED, HoldKind.UNCERTAIN.value + "%"),
+                "UPDATE outbound_queue SET delivery_hold=NULL, hold_reason=NULL, unconfirmed_at=? "
+                "WHERE id=? AND delivery_state=? AND delivery_hold LIKE ?",
+                (time.time(), row_id, QUEUED, HoldKind.UNCERTAIN.value + "%"),
             )
             if cursor.rowcount != 1:
                 raise QueuePersistenceError(f"Queue row {row_id} changed before it could be sent again.")

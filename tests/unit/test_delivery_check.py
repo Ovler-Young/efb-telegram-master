@@ -45,12 +45,11 @@ def keys(row_id, text="hello", *, kind="text", attempt=ATTEMPT, file_name="", ta
                    text=text, digest=dc._digest(text), file_name=file_name, target=target)
 
 
-def seen(message_id, text="hello", *, date=ATTEMPT + 30, author=BOT, kind="text", edited=False,
-         forwarded=False, file_name="", thread=None):
+def seen(message_id, text="hello", *, date=ATTEMPT + 30, author=BOT, kind="text", forwarded=False, file_name="",
+         thread=None):
     normal = " ".join(text.split())
     return Seen(id=message_id, date=date, author=author, kind=kind, file_name=file_name,
-                digest=dc._digest(normal), length=len(normal), thread=thread, forwarded=forwarded,
-                edited=edited, message=None)
+                digest=dc._digest(normal), length=len(normal), thread=thread, forwarded=forwarded, message=None)
 
 
 def run(rows, messages, *, logged=(), state=ReadState.CLOSED, exact=True, now=NOW):
@@ -122,11 +121,24 @@ def test_recent_attempt_is_too_early_for_its_whole_cluster():
     assert verdicts(run([keys(1, attempt=NOW - 100), recent], [seen(105)])) == {1: Verdict.TOO_EARLY, 2: Verdict.TOO_EARLY}
 
 
-def test_message_edited_since_matches_on_other_keys_for_one_cluster_only():
-    edited = seen(105, "text changed later", edited=True)
-    assert verdicts(run([keys(1)], [edited])) == {1: Verdict.FOUND}
-    # two different clusters compete for the same edited message: neither may claim it
-    assert set(verdicts(run([keys(1), keys(2, "another text")], [edited])).values()) == {Verdict.AMBIGUOUS}
+def test_message_edited_since_with_other_text_is_a_near_miss():
+    edited = types.Message(id=105, peer_id=types.PeerChannel(1), message="text changed later",
+                           from_id=types.PeerUser(BOT), date=datetime.datetime.fromtimestamp(ATTEMPT + 30, datetime.timezone.utc),  # noqa: UP017 - datetime.UTC needs Python 3.11
+                           edit_date=datetime.datetime.fromtimestamp(ATTEMPT + 90, datetime.timezone.utc))  # noqa: UP017
+    assert verdicts(run([keys(1)], [Seen.from_message(edited)])) == {1: Verdict.AMBIGUOUS}
+
+
+@pytest.mark.parametrize("header, row_thread", [
+    # outside a forum, a reply to a reply names the top of its chain, which is no topic
+    (types.MessageReplyHeader(reply_to_msg_id=90, reply_to_top_id=80), None),
+    (types.MessageReplyHeader(reply_to_msg_id=90, reply_to_top_id=77, forum_topic=True), 77),
+    (types.MessageReplyHeader(reply_to_msg_id=77, forum_topic=True), 77),
+])
+def test_only_a_forum_topic_is_a_topic(header, row_thread):
+    reply = types.Message(id=105, peer_id=types.PeerChannel(1), message="hello", from_id=types.PeerUser(BOT),
+                          date=datetime.datetime.fromtimestamp(ATTEMPT + 30, datetime.timezone.utc),  # noqa: UP017 - datetime.UTC needs Python 3.11
+                          reply_to=header)
+    assert verdicts(run([keys(1, thread=row_thread)], [Seen.from_message(reply)])) == {1: Verdict.FOUND}
 
 
 def test_rows_in_different_clusters_never_share_one_message():
@@ -156,16 +168,11 @@ def test_recent_cluster_holds_back_a_message_another_cluster_could_take():
     assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.TOO_EARLY}
 
 
-def test_recent_cluster_holds_back_an_edited_message_another_cluster_could_take():
-    rows = [keys(1, "first text"), keys(2, "second text", attempt=ATTEMPT + 3)]
-    edited = seen(105, "changed later", edited=True, date=ATTEMPT + 5)
-    out = run(rows, [edited], now=ATTEMPT + dc.WINDOW + dc.AFTER_SLACK + 1)
-    assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.TOO_EARLY}
-
-
-def test_edited_message_matched_on_text_by_one_cluster_is_not_claimed_by_another():
-    matched = seen(105, "hello", edited=True)
-    assert verdicts(run([keys(1), keys(2, "another text")], [matched])) == {1: Verdict.FOUND, 2: Verdict.AMBIGUOUS}
+def test_cluster_whose_span_the_chat_does_not_confirm_is_ambiguous_and_keeps_its_message():
+    rows = [keys(1, "", kind="photo", file_name="a.jpg"), keys(2, "", kind="photo", file_name="b.jpg", attempt=ATTEMPT + 3)]
+    spans = {1: Span(100, 150, ReadState.UNTRUSTED), 2: Span(100, 150, ReadState.CLOSED)}
+    out = decide(rows, spans, {CHAT: {105: seen(105, "", kind="photo")}}, lambda chat, message: False, NOW)
+    assert verdicts(out) == {1: Verdict.AMBIGUOUS, 2: Verdict.AMBIGUOUS}
 
 
 def test_edit_is_applied_when_the_target_shows_its_text():
@@ -194,8 +201,13 @@ def test_row_keys_read_the_payload():
     assert (parsed.kind, parsed.thread, parsed.text) == ("text", 9, "Hi there")
     caption = row_keys(held("send_photo", caption="a  caption", filename="p.jpg"), BOT)
     assert (caption.kind, caption.text, caption.file_name) == ("photo", "a caption", "p.jpg")
-    edit = row_keys(held("edit_message_caption", caption="c", message_id=7), BOT)
+    edit = row_keys(held("edit_message_text", text="t", message_id=7), BOT)
     assert (edit.kind, edit.target) == ("edit", 7)
+
+
+def test_caption_edit_is_left_to_the_operator():
+    # a found caption edit would be logged without the file id that only Telegram's answer carries
+    assert not eligible(held("edit_message_caption", caption="c", message_id=7))
 
 
 @pytest.mark.parametrize("row", [
@@ -311,8 +323,10 @@ def scenario(manager, monkeypatch):
     log(manager, 10, local(attempt - 60))
     log(manager, 30, local(attempt + 900))
     messages = {
+        10: real_message(10, "logged before", attempt - 60),
         12: real_message(12, "delivered text", attempt + 20),
         14: real_message(14, "near text, different", attempt + 400),
+        30: real_message(30, "logged after", attempt + 900),
         31: real_message(31, "after the window", attempt + 1000),
     }
     rows = [
@@ -341,18 +355,65 @@ def test_pass_resolves_found_and_not_found_and_leaves_the_rest(scenario):
     assert len(applied) == 2            # a decided row is not decided again; the recent one is still waiting
 
 
+def check_one(manager, row, messages):
+    applied = []
+    check = HeldSendCheck(
+        api_id=1, api_hash="h", tokens={None: f"{BOT}:secret"}, db=manager, list_rows=lambda: [row],
+        resolve=lambda row_id, verdict, seen_message, bot: applied.append((row_id, verdict, seen_message and seen_message.id)) or True,
+        client_factory=lambda: RecordingClient(messages))
+    return applied, asyncio.run(check.run_pass())
+
+
+@pytest.mark.parametrize("late", [None, "upper", "lower"])
+def test_logged_messages_bound_the_span_only_when_the_chat_agrees(manager, monkeypatch, late):
+    """The held send was delivered as message 108. A log entry written late carries an id out of time order:
+    a confirmation logs an older message now, a combined message sent late keeps its first source's time."""
+    monkeypatch.setattr(dc, "PACE", 0.0)
+    attempt = time.time() - 3600
+    local = datetime.datetime.fromtimestamp
+    log(manager, 100, local(attempt - 60))
+    messages = {
+        100: real_message(100, "logged before", attempt - 60),
+        105: real_message(105, "an older send", attempt - 30),
+        108: real_message(108, "second", attempt + 20),
+        120: real_message(120, "combined, sent late", attempt + 300),
+        130: real_message(130, "after the window", attempt + 1000, author=OTHER_BOT),
+    }
+    if late == "upper":
+        log(manager, 105, local(attempt + 700))     # logged after the window, dated before the attempt
+    elif late == "lower":
+        log(manager, 120, local(attempt - 30))      # logged before the attempt, dated after it
+    row = HeldRow(2, CHAT, "send_message", payload(text="second"), "mod.chat", None, attempt, "uncertain:TimedOut")
+
+    applied, counts = check_one(manager, row, messages)
+
+    if late is None:
+        assert applied == [(2, Verdict.FOUND, 108)]
+    else:
+        assert applied == [] and counts["ambiguous"] == 1
+
+
+def test_a_logged_message_the_chat_does_not_show_bounds_nothing(manager, monkeypatch):
+    monkeypatch.setattr(dc, "PACE", 0.0)
+    attempt = time.time() - 3600
+    log(manager, 100, datetime.datetime.fromtimestamp(attempt - 60))     # deleted from the chat since
+    row = HeldRow(2, CHAT, "send_message", payload(text="second"), "mod.chat", None, attempt, "uncertain:TimedOut")
+
+    applied, counts = check_one(manager, row, {130: real_message(130, "after the window", attempt + 1000)})
+
+    assert applied == [] and counts["ambiguous"] == 1
+
+
 def test_flood_wait_is_waited_out_and_the_read_retried(monkeypatch):
     monkeypatch.setattr(dc, "PACE", 0.0)
     monkeypatch.setattr(dc, "FLOOD_EXTRA", 0.0)
-    client = RecordingClient({7: real_message(7, "x", ATTEMPT)})
-    original = client.__call__
     pending = [errors.FloodWaitError(request=None, capture=0)]
 
     class Flooded(RecordingClient):
         async def __call__(self, request):
             if pending:
                 raise pending.pop()
-            return await original(request)
+            return await super().__call__(request)
 
     flooded = Flooded({7: real_message(7, "x", ATTEMPT)})
     reader = dc.BotReader(f"{BOT}:secret", 1, "h", client_factory=lambda: flooded)
@@ -434,8 +495,10 @@ def channel(request, tmp_path, monkeypatch):
             queue.connection.execute("UPDATE outbound_queue SET slave_id=?, attempt_started_at=? WHERE id=?",
                                      ("mod.chat", started, row_id))
     client = RecordingClient({
+        10: real_message(10, "logged before", attempt - 60),
         12: real_message(12, "delivered text", attempt + 20),
         14: real_message(14, "twin", attempt + 210),     # one message for two identical rows
+        30: real_message(30, "logged after", attempt + 900),
         31: real_message(31, "after the window", attempt + 1000),
     })
     monkeypatch.setattr(dc, "TelegramClient", lambda *args, **kwargs: client)

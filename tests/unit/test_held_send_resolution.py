@@ -142,9 +142,23 @@ def test_recent_send_not_in_the_chat_is_sent_again_unchanged(tmp_path, make_queu
 
     after = rows(queue)
     names = [d[0] for d in queue.connection.execute("SELECT * FROM outbound_queue LIMIT 0").description]
-    assert {name for name, old, new in zip(names, before[row_id], after[row_id]) if old != new} == {"delivery_hold"}
+    changed = {name for name, old, new in zip(names, before[row_id], after[row_id]) if old != new}
+    assert changed == {"delivery_hold", "hold_reason", "unconfirmed_at"}
+    assert after[row_id][names.index("hold_reason")] is None      # the error text of the hold goes with it
     assert classify(after[row_id][names.index("delivery_state")], None) is RowState.WAITING
     assert media.exists()
+
+
+def test_send_sent_again_by_the_check_and_missing_again_stays_held(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    manager = manager_for(queue)
+    row_id = held(queue, "send_message", {"chat_id": CHAT, "text": "hi"})
+    assert manager._resolve_held_send(row_id, Verdict.NOT_FOUND, None, BOT)
+    _hold(queue, row_id, TimedOut("response lost"))          # the second try timed out too
+    before = rows(queue)
+
+    assert not manager._resolve_held_send(row_id, Verdict.NOT_FOUND, None, BOT)
+    assert rows(queue) == before and hold_of(queue, row_id) == "uncertain:TimedOut"
 
 
 @pytest.mark.parametrize("why", ["old", "media_gone"])
@@ -204,6 +218,42 @@ def test_edit_not_applied_is_dropped_when_a_newer_edit_exists(tmp_path, make_que
     assert rows(queue) == others
 
 
+MEMBER = {"origin_uid": "origin", "source_id": "1"}
+
+
+def appending_edit(queue):
+    """A held edit that appends a new message to a combined message: that message's only copy."""
+    return held(queue, "edit_message_text", {"chat_id": CHAT, "message_id": 50, "_required_sender_bot_id": "901",
+                                             "text": "one\ntwo"}, context=_context("aggregate", members=[MEMBER]))
+
+
+def test_edit_appending_to_a_combined_message_stays_held_when_a_newer_edit_is_queued(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    manager = manager_for(queue)
+    row_id = appending_edit(queue)
+    _add(queue, "edit_message_text", {"chat_id": CHAT, "message_id": 50, "_required_sender_bot_id": "901", "text": "newer"})
+    before = rows(queue)
+
+    assert not manager._resolve_held_send(row_id, Verdict.NOT_FOUND, chat_message(50, "one"), BOT)
+    assert rows(queue) == before
+
+
+@pytest.mark.parametrize("later", ["combined_update_queued", "combined_message_edited"])
+def test_later_update_of_a_combined_message_is_not_a_newer_edit(tmp_path, make_queue, later):
+    queue = make_queue(tmp_path)
+    manager = manager_for(queue)
+    row_id = appending_edit(queue)
+    target = chat_message(50, "one")
+    if later == "combined_update_queued":
+        _add(queue, "edit_message_text", {"chat_id": CHAT, "message_id": 50, "_required_sender_bot_id": "901",
+                                          "text": "one (edited)"}, context=_context("member_update", member=MEMBER))
+    else:
+        target = chat_message(50, "one (edited)", edited=now())
+
+    assert manager._resolve_held_send(row_id, Verdict.NOT_FOUND, target, BOT)
+    assert hold_of(queue, row_id) is None
+
+
 def test_edit_not_applied_without_a_newer_edit_is_sent_again(tmp_path, make_queue):
     queue = make_queue(tmp_path)
     manager = manager_for(queue)
@@ -261,7 +311,7 @@ def test_check_starts_only_with_both_api_values():
     assert isinstance(check, HeldSendCheck) and check._tokens == {None: "900:main", str(BOT): f"{BOT}:aux"}
 
 
-def test_graceful_stop_ends_the_check_before_the_queue_closes(tmp_path, make_queue):
+def test_graceful_stop_ends_the_check_before_the_queue_closes():
     order = []
     check = HeldSendCheck(api_id=1, api_hash="h", tokens={}, db=None, list_rows=list, resolve=Mock())
     check.start()
