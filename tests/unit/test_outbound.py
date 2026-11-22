@@ -1821,6 +1821,8 @@ def _apply(queue, directory, row_id, event):
         Event.DEFER_RECONCILIATION: lambda: queue.defer_reconciliation([row_id], time.time()),
         Event.REMOVE: lambda: queue.delete(row_id),
         Event.WITHDRAW: lambda: queue.cancel_logical_aggregation(row_id),
+        Event.DISCARD: lambda: queue.discard_held(row_id),
+        Event.RESEND: lambda: queue.resend_uncertain(row_id),
     }
     calls[event]()
 
@@ -1864,7 +1866,7 @@ def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spell
     _writers, stored, expected = ROW_SPELLINGS[spelling]
     mismatches = []
     for event in Event:
-        if event in (Event.DISCARD, Event.REPLACE_REQUEST, Event.RESEND):
+        if event is Event.REPLACE_REQUEST:
             continue  # Chosen by what a row stores, not called on one row: see test_clear_unsendable.
         directory = tmp_path / event.value
         queue = make_queue(directory)

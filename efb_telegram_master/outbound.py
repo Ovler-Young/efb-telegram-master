@@ -3048,6 +3048,98 @@ class OutboundQueue:
             self._hold(row_id, Event.HOLD_FAILED_HISTORY,
                        format_hold(HoldKind.HISTORY_FAILED, error_detail(error)))
 
+    def resend_uncertain(self, row_id: int) -> None:
+        """Send an uncertain row again: its chat shows it never arrived. Only the hold is cleared."""
+        with self._lock, self.connection:
+            self._transition(row_id, Event.RESEND, dependents=True)
+            cursor = self.connection.execute(
+                "UPDATE outbound_queue SET delivery_hold=NULL WHERE id=? AND delivery_state=? AND delivery_hold LIKE ?",
+                (row_id, QUEUED, HoldKind.UNCERTAIN.value + "%"),
+            )
+            if cursor.rowcount != 1:
+                raise QueuePersistenceError(f"Queue row {row_id} changed before it could be sent again.")
+
+    def discard_held(self, row_id: int) -> list[QueuedCall]:
+        """Remove a held row that will never be sent, and the container edits that need it.
+
+        A held or waiting edit of a container that does not exist yet, ordered
+        behind a removed row, is removed with it: it cannot be sent without the
+        container. A queue-owned media file is deleted only when no remaining row
+        names it; external media files are never deleted. Returns the removed
+        rows, the held row first.
+        """
+        from .queued_log import decode_aggregation
+        columns = ("id, priority, telegram_chat_id, operation, payload, slave_id, required_sender_bot_id, "
+                   "created_at, log_context, delivery_state, completion_receipt, predecessor_id, thread_id")
+        with self._lock:
+            try:
+                self.connection.execute("BEGIN")
+                self._transition(row_id, Event.DISCARD, dependents=True)
+                removed: list[QueuedCall] = []
+                pending = [row_id]
+                while pending:
+                    current = pending.pop()
+                    row = self.connection.execute(
+                        f"SELECT {columns} FROM outbound_queue WHERE id=?", (current,)).fetchone()
+                    removed.append(QueuedCall(
+                        row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10],
+                        predecessor_id=row[11], thread_id=row[12]))
+                    for child, state, hold, retry_after, context in self.connection.execute(
+                        "SELECT id, delivery_state, delivery_hold, reconcile_after, log_context "
+                        "FROM outbound_queue WHERE predecessor_id=? AND id!=? ORDER BY id", (current, current),
+                    ).fetchall():
+                        child_state = classify(state, hold, retry_after or 0.0, time.time())
+                        if child_state not in (RowState.WAITING, RowState.DEFERRED) and next_state(
+                                child_state, Event.DISCARD) is None:
+                            continue
+                        try:
+                            own = decode_aggregation(bytes(context)) if context is not None else None
+                        except Exception:  # noqa: BLE001 - a damaged context is not a container edit
+                            own = None
+                        if own and own.get("kind") == ContextKind.MEMBER_UPDATE and not own.get("container_id"):
+                            self._mark_row_destinations_dirty(child, dependents=True)
+                            pending.append(child)
+                ids = [row.id for row in removed]
+                self.connection.executemany("DELETE FROM outbound_queue WHERE id=?", [(i,) for i in ids])
+                sidecars: set[str] = set()
+                for row in removed:
+                    try:
+                        sidecars.update(name for kind, name in self._media_reference_keys(bytes(row.payload))
+                                        if kind == "stored")
+                    except InvalidQueuedPayloadError:
+                        pass  # Its file names cannot be read: its files are kept.
+                if sidecars:
+                    sidecars = self._unnamed_sidecars(sidecars)
+                self.connection.commit()
+            except Exception:
+                try:
+                    self.connection.rollback()
+                except self._database_errors:
+                    pass
+                raise
+        for name in sidecars:
+            try:
+                (self.media_dir / name).unlink()
+            except OSError:
+                pass
+        return removed
+
+    def _unnamed_sidecars(self, names: set[str]) -> set[str]:
+        """The names among ``names`` that no stored row's payload contains; none when a row cannot be read."""
+        for row_id, version, size in self.connection.execute(
+            "SELECT id, substr(payload, 1, 1), length(payload) FROM outbound_queue"
+        ).fetchall():
+            if bytes(version) == b"\x01":
+                continue  # Older rows keep their media inline, not in sidecars.
+            if bytes(version) != b"\x02" or size > self.MAX_INSPECT_BYTES:
+                return set()
+            payload = bytes(self.connection.execute(
+                "SELECT payload FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0])
+            names = {name for name in names if name.encode() not in payload}
+            if not names:
+                break
+        return names
+
     def defer_acquisition(self, row_id: int, minimum_delay: float = 0, *, counted: bool = True) -> float:
         """Persist capped backoff for an acquisition that never attempted a send.
 

@@ -20,24 +20,30 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Collection, Coroutine, Iterator, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Collection, Coroutine, Iterator, List, Literal, Mapping, NamedTuple, Optional, ParamSpec, Protocol, TypeAlias, Tuple, TypeVar, cast
 from urllib.parse import quote, urlparse, urlunparse
 from unittest.mock import Mock, patch
 
 import httpx
 import telegram.constants
 import telegram.error
-from telegram import File, ForumTopic, InlineKeyboardMarkup, InputFile, InputMedia, Update, User
+from telegram import (
+    Animation, Audio, Chat, Document, File, ForumTopic, InlineKeyboardMarkup, InputFile, InputMedia, PhotoSize,
+    Sticker, Update, User, Video, Voice,
+)
 from telegram import Message as TelegramMessage
 from telegram.ext import Application, CallbackContext, MessageHandler, TypeHandler
 from telegram.ext import _applicationbuilder as ptb_applicationbuilder
 from telegram.request import HTTPXRequest
+from telethon import types as mtproto_types, utils as mtproto_utils
 
 from .auxiliary_bot import AuxiliaryBot
 from .aggregation_states import ContextEvent, ContextState, context_state
 from .bot_pool import BotPool
+from .clear_unsendable import missing_media
 from .custom_emoji import AuthorEmojiHeader, strip_custom_emoji_tag
-from .delivery_states import OPERATOR_HOLD, Event, classify, next_state
+from .delivery_check import HeldRow, HeldSendCheck, Seen, Verdict
+from .delivery_states import OPERATOR_HOLD, QUEUED, Event, HoldKind, RowState, classify, next_state
 from .locale_mixin import LocaleMixin
 from .msg_type import get_msg_type
 from .outbound import (
@@ -52,7 +58,9 @@ from .outbound import (
     transport_definitely_not_sent,
     IllegalAggregationTransitionError,
     QueueEnqueueError,
+    QueueError,
     QueuePersistenceError,
+    InvalidQueuedPayloadError,
     check_context_transition,
     InvalidTelegramResponseError,
     QueueRequest,
@@ -354,6 +362,61 @@ class SendReceipt:
         return cast(ReplyTarget, self.message).message_id
 
 
+# A held send the chat shows was never delivered is sent again only within this time of its attempt.
+HELD_RESEND_SECONDS = 86400
+NO_FILE_ID = ""   # the Bot API types turn None into "None"
+
+
+def _chat_receipt(seen: Seen, bot_id: int) -> TelegramMessage:
+    """A Bot API message for a held send found in its chat, built from the message read there.
+
+    The chat read gives no Bot API file ids, so the media objects carry an empty one, which every reader
+    of a logged file id treats as absent; their kind, names, types and sizes are those of the delivered
+    message.
+    """
+    source = seen.message
+    text = source.message or None
+    media: dict[str, Any] = {}
+    if seen.kind == "photo":
+        sizes = [size for size in getattr(source.media.photo, "sizes", ()) if hasattr(size, "w")]
+        media["photo"] = tuple(PhotoSize(NO_FILE_ID, NO_FILE_ID, size.w, size.h, getattr(size, "size", None))
+                               for size in sizes) or (PhotoSize(NO_FILE_ID, NO_FILE_ID, 0, 0),)
+    elif seen.kind != "text":
+        document = source.media.document
+        attributes = {type(attribute): attribute for attribute in document.attributes}
+        named = attributes.get(mtproto_types.DocumentAttributeFilename)
+        file = {"file_name": named.file_name if named else None, "mime_type": document.mime_type,
+                "file_size": document.size}
+        video = attributes.get(mtproto_types.DocumentAttributeVideo)
+        shape = video or attributes.get(mtproto_types.DocumentAttributeImageSize)
+        width, height = getattr(shape, "w", 0), getattr(shape, "h", 0)
+        sound = attributes.get(mtproto_types.DocumentAttributeAudio)
+        duration = int(getattr(video or sound, "duration", 0) or 0)
+        if seen.kind == "animation":
+            media["animation"] = Animation(NO_FILE_ID, NO_FILE_ID, width, height, duration, **file)
+            media["document"] = Document(NO_FILE_ID, NO_FILE_ID, **file)    # as the Bot API reports an animation
+        elif seen.kind == "video":
+            media["video"] = Video(NO_FILE_ID, NO_FILE_ID, width, height, duration, **file)
+        elif seen.kind == "sticker":
+            media["sticker"] = Sticker(
+                NO_FILE_ID, NO_FILE_ID, width, height, document.mime_type == "application/x-tgsticker",
+                document.mime_type == "video/webm", Sticker.REGULAR, file_size=document.size)
+        elif seen.kind == "audio":
+            media["audio"] = Audio(NO_FILE_ID, NO_FILE_ID, duration, getattr(sound, "performer", None),
+                                   getattr(sound, "title", None), **file)
+        elif seen.kind == "voice":
+            media["voice"] = Voice(NO_FILE_ID, NO_FILE_ID, duration, document.mime_type, document.size)
+        else:
+            media["document"] = Document(NO_FILE_ID, NO_FILE_ID, **file)
+    return TelegramMessage(
+        seen.id, source.date,
+        Chat(mtproto_utils.get_peer_id(source.peer_id), Chat.SUPERGROUP, is_forum=seen.thread is not None or None),
+        from_user=User(bot_id, "", True),
+        message_thread_id=seen.thread, is_topic_message=seen.thread is not None or None,
+        **({"text": text} if seen.kind == "text" else {"caption": text}), **media,
+    )
+
+
 def _has_callback_keyboard(reply_markup) -> bool:
     """Check if a reply_markup contains InlineKeyboardButtons with callback_data."""
     if not isinstance(reply_markup, InlineKeyboardMarkup):
@@ -586,6 +649,7 @@ class TelegramBotManager(LocaleMixin):
         )
         from .live_aggregate import LiveTextAggregation
         self.live_aggregation = LiveTextAggregation(self)
+        self._held_send_check = self._build_held_send_check(config)
         self._register_runtime_metric_collectors(metrics_top_n)
 
         if metrics_endpoint is not None:
@@ -749,6 +813,9 @@ class TelegramBotManager(LocaleMixin):
                 daemon=True,
             )
             self._send_worker_thread.start()
+            held_send_check = getattr(self, "_held_send_check", None)
+            if held_send_check is not None:
+                held_send_check.start()
         self._shutdown_complete_event.clear()
 
 
@@ -1960,6 +2027,105 @@ class TelegramBotManager(LocaleMixin):
             self._outbound_scheduler.wake_event.set()
             return completed
 
+    def _build_held_send_check(self, config: Mapping) -> HeldSendCheck | None:
+        """The check of held sends against their chats; None without ``api_id`` and ``api_hash``."""
+        if config.get('api_id') is None or config.get('api_hash') is None:
+            self.logger.info("Held sends are not checked against their chats: api_id and api_hash are not set.")
+            return None
+        tokens: dict[str | None, str] = {None: config['token']}
+        for auxiliary in self.bot_pool.bots if self.bot_pool else ():
+            tokens[str(auxiliary.bot_id)] = auxiliary._token
+        return HeldSendCheck(
+            api_id=int(config['api_id']), api_hash=str(config['api_hash']), tokens=tokens, db=self.channel.db,
+            list_rows=self._held_rows, resolve=self._resolve_held_send,
+        )
+
+    def _held_rows(self) -> list[HeldRow]:
+        queue = self._outbound_queue
+        with queue._lock:
+            rows = queue.connection.execute(
+                "SELECT id, telegram_chat_id, operation, payload, slave_id, attempt_sender_bot_id, "
+                "attempt_started_at, delivery_hold, thread_id FROM outbound_queue "
+                "WHERE delivery_state=? AND delivery_hold LIKE ? ORDER BY id",
+                (QUEUED, HoldKind.UNCERTAIN.value + "%"),
+            ).fetchall()
+        return [HeldRow(*row) for row in rows]
+
+    def _resolve_held_send(self, row_id: int, verdict: Verdict, seen: Seen | None, reader_bot_id: int) -> bool:
+        """Apply what the chat shows about a held send; False when the row is left held.
+
+        Found: the message is recorded as the delivery, as ``/confirm_send`` does; nothing is sent.
+        Not found: sent again when its attempt is recent and its media is all there, else discarded.
+        """
+        if verdict is Verdict.FOUND:
+            assert seen is not None
+            try:
+                self.confirm_queued_delivery(row_id, _chat_receipt(seen, reader_bot_id))
+            except ValueError:
+                return False
+            return True
+        queue, scheduler = self._outbound_queue, self._outbound_scheduler
+        with scheduler._lock:
+            if row_id in scheduler.in_flight:
+                return False
+            with queue._lock:
+                row = queue.connection.execute(
+                    "SELECT telegram_chat_id, operation, payload, attempt_started_at, delivery_state, delivery_hold "
+                    "FROM outbound_queue WHERE id=?", (row_id,),
+                ).fetchone()
+            if row is None or classify(row[4], row[5]) is not RowState.UNCERTAIN:
+                return False  # resolved meanwhile
+            chat_id, operation, payload, attempt_started_at = row[:4]
+            if self._may_resend(row_id, chat_id, operation, payload, attempt_started_at, seen):
+                queue.resend_uncertain(row_id)
+                scheduler.wake_event.set()
+                return True
+            removed = queue.discard_held(row_id)
+            for item in reversed(removed):
+                scheduler._reopen_aggregation(item)
+            error = QueueError("The chat shows this send never arrived; it was discarded.")
+            for item in removed:
+                queue.record_removal(item, "terminal_discard")
+                queue.fail_waiter(item.id, error)
+                self.finish_discarded_delivery(item)
+            scheduler.wake_event.set()
+        return True
+
+    def _may_resend(self, row_id: int, chat_id: int, operation: str, payload: bytes,
+                    attempt_started_at: float | None, target: Seen | None) -> bool:
+        """Whether a held send its chat lacks is sent again rather than discarded."""
+        if attempt_started_at is None or time.time() - attempt_started_at >= HELD_RESEND_SECONDS:
+            return False
+        try:
+            args, kwargs = OutboundQueue.decode_payload_raw(bytes(payload))
+        except InvalidQueuedPayloadError:
+            return False
+        references: list = []
+        OutboundQueue._collect_media_references((args, kwargs), references)
+        if missing_media(references, self._outbound_queue.media_dir) is not None:
+            return False
+        if not operation.startswith("edit_message_"):
+            return True
+        # An edit is dropped when a newer edit of the same message was sent or is queued.
+        edited_at = target.message.edit_date if target is not None else None
+        if edited_at is not None and edited_at.timestamp() > attempt_started_at:
+            return False
+        queue = self._outbound_queue
+        with queue._lock:
+            later = queue.connection.execute(
+                "SELECT operation, payload FROM outbound_queue WHERE telegram_chat_id=? AND id>?", (chat_id, row_id),
+            ).fetchall()
+        for later_operation, later_payload in later:
+            if not later_operation.startswith("edit_message_"):
+                continue
+            try:
+                _args, later_kwargs = OutboundQueue.decode_payload_raw(bytes(later_payload))
+            except InvalidQueuedPayloadError:
+                continue
+            if later_kwargs.get("message_id") == kwargs.get("message_id"):
+                return False
+        return True
+
     def record_queued_success(
         self, row, result: object, selection: SenderSelection
     ) -> QueuedCompletionDecision:
@@ -2669,7 +2835,12 @@ class TelegramBotManager(LocaleMixin):
         self._stopping.set()
         self.logger.info("Starting graceful shutdown...")
 
-        # Stop the queued send worker first
+        # The held-send check writes to the queue, so it stops before the queue closes.
+        held_send_check = getattr(self, "_held_send_check", None)
+        if held_send_check is not None:
+            held_send_check.stop()
+
+        # Then stop the queued send worker
         self.stop_queued_worker()
 
         TelegramBotManager._stop_metrics_server(self)

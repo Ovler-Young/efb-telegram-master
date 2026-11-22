@@ -132,7 +132,7 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     # Or replaces its request with one that can be sent (the caption of a gone
     # media file, as text); the row is then sent like a new one.
     **_from(HELD_STATES - {RowState.UNRECOGNIZED_HOLD}, Event.REPLACE_REQUEST, RowState.WAITING),
-    # Or lets an ambiguous send found not delivered be sent again, unchanged.
+    # The destination chat shows that an uncertain send never arrived: send it again.
     (RowState.UNCERTAIN, Event.RESEND): RowState.WAITING,
 }
 

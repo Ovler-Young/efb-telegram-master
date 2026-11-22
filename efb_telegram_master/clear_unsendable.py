@@ -76,11 +76,9 @@ _RESEND = (
 )
 
 
-def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str | None:
-    """Why a held row can never be sent, or None. ``references`` is None when not inspected."""
-    if state is RowState.INVALID_PAYLOAD:
-        return INVALID_PAYLOAD
-    for reference in references or ():
+def missing_media(references, media_dir: Path) -> str | None:
+    """Why the stored media ``references`` of a row cannot be sent, or None when every file is there."""
+    for reference in references:
         if reference.external_uri is not None:
             # Replay downloads a missing web file again; a local one is gone for good.
             if urlsplit(reference.external_uri).scheme.lower() in {"http", "https"}:
@@ -92,6 +90,16 @@ def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str 
             return INVALID_PAYLOAD
         elif not (media_dir / reference.storage_name).is_file():
             return MISSING_SIDECAR
+    return None
+
+
+def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str | None:
+    """Why a held row can never be sent, or None. ``references`` is None when not inspected."""
+    if state is RowState.INVALID_PAYLOAD:
+        return INVALID_PAYLOAD
+    problem = missing_media(references or (), media_dir)
+    if problem is not None:
+        return problem
     if state is RowState.AGGREGATION_FAILED:
         parsed = parse_hold(hold)
         if parsed is not None and parsed[1].split("/", 1)[0] == "BadRequest":

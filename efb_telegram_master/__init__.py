@@ -248,6 +248,15 @@ class TelegramChannel(MasterChannel):
                             self._('Duplicate token found in auxiliary_bots[{idx}].').format(idx=idx))
                     seen_tokens.add(entry['token'])
 
+            # Optional: with both, held sends are checked against their chats.
+            if isinstance(data.get('api_id'), str) and data['api_id'].isdigit():
+                data['api_id'] = int(data['api_id'])
+            if data.get('api_id') is not None and (
+                    isinstance(data['api_id'], bool) or not isinstance(data['api_id'], int)):
+                raise ValueError(self._('api_id must be a number.'))
+            if data.get('api_hash') is not None and not isinstance(data['api_hash'], str):
+                raise ValueError(self._('api_hash must be a string.'))
+
             self.config = data.copy()
 
     def info(self, update: Update, context: CallbackContext):

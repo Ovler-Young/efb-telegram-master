@@ -351,7 +351,8 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
             if message is not None and message.digest == keys.digest and message.length == len(keys.text):
                 applied = index
         for index, keys in enumerate(members):
-            out[keys.id] = Decision(Verdict.FOUND, message) if index <= applied else Decision(Verdict.NOT_FOUND)
+            # A not applied edit carries the message it changes: a later edit date shows a newer edit.
+            out[keys.id] = Decision(Verdict.FOUND if index <= applied else Verdict.NOT_FOUND, message)
 
     deferred = []
     contenders: list[tuple[list[RowKeys], dict[int, list[Seen]]]] = []
@@ -496,8 +497,9 @@ class HeldSendCheck:
     """Decides held sends in a daemon thread with its own event loop.
 
     ``list_rows() -> list[HeldRow]`` lists the held rows. ``resolve(row_id, verdict, seen, reader_bot_id) ->
-    bool`` applies a ``FOUND`` or ``NOT_FOUND`` verdict (``seen`` is the matched message for ``FOUND``, else
-    None) and returns whether it was applied; it is not called for ``AMBIGUOUS`` or ``TOO_EARLY``. ``tokens``
+    bool`` applies a ``FOUND`` or ``NOT_FOUND`` verdict and returns whether it was applied; it is not called
+    for ``AMBIGUOUS`` or ``TOO_EARLY``. ``seen`` is the matched message for a found send, the message an edit
+    changes for an edit (None when it cannot be read), and None for a send not found. ``tokens``
     maps a sender bot id (None for the main bot) to its token. ``db`` is the ``DatabaseManager``.
     """
 

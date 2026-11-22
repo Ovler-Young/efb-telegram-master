@@ -9,7 +9,7 @@ An ambiguous failure is stored as `uncertain:<exception-class>/<cause-class>`.
 No request objects, tokens or exception tracebacks are persisted in this field.
 
 Held rows keep their payload, sidecar and original MsgLog context. They are not
-silently marked sent and are not deleted. Other runnable rows, including newer
+silently marked sent. Other runnable rows, including newer
 messages to the same chat, continue. Definite RetryAfter rejections still retry
 at the requested deadline. ConnectError/ConnectTimeout/PoolTimeout causes are
 also retryable because the HTTP request was not sent. Read/write failures and
@@ -17,7 +17,62 @@ unknown network outcomes are not blindly retried for message-creating calls.
 
 This is not an exactly-once transport guarantee: after loss of the response,
 remote success requires evidence. No increasing retry count, arbitrary file-size
-limit, or longer timeout can supply that missing evidence.
+limit, or longer timeout can supply it; the destination chat can. With
+`api_id` and `api_hash` set, the bot reads the chat back and ends such holds by
+itself ([Checking held sends against the chat](#checking-held-sends-against-the-chat)).
+Otherwise an operator ends them with `/confirm_send`.
+
+## Checking held sends against the chat
+
+Add both keys to the channel's `config.yaml` (the values of an application
+registered at my.telegram.org). Without both, nothing is read, no extra login
+is made, and held sends wait for `/confirm_send`.
+
+```yaml
+token: "12345678:1a2b3c4d5e6g7h8i9j"
+api_id: 123456
+api_hash: "0123456789abcdef0123456789abcdef"
+```
+
+Each held send is read back by the bot that attempted it: the main bot, or the
+auxiliary bot recorded in `attempt_sender_bot_id`, logs in with its own token
+over MTProto, keeps its session in memory only and takes no updates. It only
+looks up the chat and reads messages by id; it never sends, edits or deletes. A
+row whose bot is no longer configured stays held.
+
+The check runs in its own thread, about a minute after the send worker starts
+and then every 10 minutes, so the first pass covers every send held at
+startup. It reads rows held as `uncertain:<Class>` with a recorded attempt time,
+in supergroups, for `send_message`, `send_photo`, `send_animation`,
+`send_video`, `send_document`, `send_sticker`, `send_audio`, `send_voice`,
+`edit_message_text` and `edit_message_caption`. Operator holds
+(`uncertain:operator_observed_delivery`), interrupted attempts (`in_flight`)
+and every other hold are left as they are. A row is decided once its attempt
+is 11 minutes old. Each bot makes at most one call every 15 seconds and waits
+out a flood wait, so a large first pass takes a while; sends are not slowed by
+it.
+
+A send is looked for among the message ids between the last message logged for
+its source chat before the attempt and the first one logged after it, reading
+on until a message dated after the window is seen. A message matches when it
+is from the same bot, not a forward, not already in the message log, dated from
+5 seconds before to 10 minutes after the attempt, of a compatible type, in the
+same topic, and carries the same text or caption (a caption Telegram cut, by
+its start). Sends that look the same are matched to one message each. An edit
+was applied when the message it changes shows its text.
+
+| The chat shows | What the bot does |
+|---|---|
+| a matching message | Records it as the delivery, as `/confirm_send` does, and never sends the row again. The log entry has the message's id, author and media type but no Bot API file id. |
+| no such message, the attempt is less than a day old and every media file it names is still there | Clears the hold, so the send goes out again, after the messages sent since. An edit is dropped instead when a newer edit of the same message is queued, or the message was edited after the attempt. |
+| no such message, otherwise | Discards the row, with the container edits that need it (as `needs_removed_row` below). A queue-owned file is deleted only when no remaining row names it; external media files are never deleted. |
+| nothing that decides it (several candidates, a near miss with other text, a span it could not close) | Nothing: the row stays held. It is read again after a restart. |
+
+A discarded or confirmed row never needs `/confirm_send`; the command still works
+for every row the check leaves held. Each pass logs one line with counts only,
+for example `Held-send check pass: ambiguous=2, calls=14, flood_waits=0,
+found=5, not_found=1, too_early=3`; message text, chat titles, tokens and the API values
+are never logged.
 
 ## An already repeating file from an older version
 
@@ -62,7 +117,8 @@ The command deliberately does not delete any duplicate messages already on
 Telegram and does not fabricate a message ID. Confirming the wrong queued item
 would create a wrong mapping; choose the actual row and its actual delivered
 message. If no delivered message can be established, keep the row held and
-investigate. There is no automatic "assume failure and resend" timer.
+investigate. Only the [chat check](#checking-held-sends-against-the-chat) sends a
+held row again, and only after reading the chat and not finding it.
 
 Do not downgrade to a revision that ignores `delivery_hold`: it can replay held
 rows. The current decoder accepts older author-only receipts and new receipts
@@ -118,7 +174,7 @@ waiting: queued and unheld, in flight, or delivered and awaiting its MsgLog writ
 A predecessor that is gone, permanently held, or linked into a cycle is not an
 ordering barrier — waiting for it either already happened or can never happen —
 so it cannot strand everything queued behind it. Held rows themselves are kept
-and still require an operator. When every waiting row defers to another waiting
+until the chat check or an operator resolves them. When every waiting row defers to another waiting
 row there is no valid order at all; the scheduler then dispatches the oldest row
 per destination and logs `deferred by predecessor links that never resolve`:
 
@@ -176,7 +232,7 @@ Stored spellings never change between versions.
 | waiting | `queued` / NULL | Will be sent when its destination's turn comes. | None. |
 | deferred | `queued` / NULL, `reconcile_after` ahead | Media acquisition failed before any send, or a send kept failing with a retryable error (a connection that never reached Telegram, a chat migration) for 3 attempts; retried after a backoff. Earlier failed sends are retried after a backoff the scheduler keeps in memory, and the row stays waiting. | None. |
 | in_flight | `queued` / `in_flight` | Attempt recorded before submission. After a restart it is an interrupted attempt that may have been delivered; opening the queue counts it as 3 failed attempts, so later rows no longer wait for it. | If delivered, `/confirm_send`; otherwise investigate. |
-| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result: Telegram may have accepted it. | `/confirm_send` on the delivered message. |
+| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result: Telegram may have accepted it. | With the chat check on, none: it confirms, sends again or discards the row. Otherwise, or for a row it leaves held, `/confirm_send` on the delivered message. |
 | uncertain (operator) | `queued` / `uncertain:operator_observed_delivery` | Held offline by `hold_send` for a send already seen on Telegram. | `/confirm_send`; any configured bot is accepted. |
 | invalid_payload | `queued` / `invalid_payload` | The stored request cannot be decoded. Not evidence of delivery. | Investigate the row. |
 | history_failed | `queued` / `history_failed:<Class>` | History replay was rejected. Startup re-queues `RequiredSenderUnavailableError` rows that never started an attempt. | Investigate, or `/confirm_send` if it was delivered. |
@@ -186,11 +242,13 @@ Stored spellings never change between versions.
 | sent_pending | `sent_pending` / NULL | Telegram receipt saved; the MsgLog write is retried with backoff. | None. |
 | absent | no row | Not yet enqueued, or removed. | None. |
 
-While the bot runs, only `/confirm_send` ends a hold (and startup, for the
-`history_failed` rows named above: when the queue opens, the schema migration
-clears only `history_failed:RequiredSenderUnavailableError` on a history row
-that never started an attempt). The bot never removes a held row or its media by
-itself. A held row that can never be sent is cleared offline. It is removed;
+While the bot runs, a hold ends by `/confirm_send`, by the
+[chat check](#checking-held-sends-against-the-chat) for an `uncertain` row, and
+at startup for the `history_failed` rows named above (when the queue opens, the
+schema migration clears only `history_failed:RequiredSenderUnavailableError` on
+a history row that never started an attempt). Apart from the chat check, the bot
+never removes a held row or its media by itself. A held row that can never be
+sent is cleared offline. It is removed;
 or, for a row found not delivered, its caption is sent as text when its media
 file is gone, or the row is sent again when it was held after a timeout and its
 files are still there:
@@ -293,13 +351,13 @@ below lists only events on an existing row.
 | defer_acquisition | waiting, deferred, in_flight | deferred | `defer_acquisition` (counts a failed attempt unless a flood wait caused it) |
 | defer_failed_send | waiting, deferred | deferred | `defer_failed_send`, after the attempt was released (counts a failed attempt and, from the 3rd, stores the backoff; earlier ones leave the state as it was; a flood wait is retried without it) |
 | record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
-| operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
+| operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` and the chat check for a found message (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
-| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
+| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` and the chat check's `discard_held` for a waiting container edit that has no container yet (`needs_removed_row`) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
-| discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
+| discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above); `discard_held`, when the chat check does not find an uncertain send it does not send again, with its container edits |
 | replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send whose file is gone and whose caption has text from the sender (above) |
-| resend | uncertain | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send held after a timeout or a cut connection whose files are all there (above) |
+| resend | uncertain | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send held after a timeout or a cut connection whose files are all there (above); `resend_uncertain`, when the chat check does not find a recent uncertain send whose media is all there; only the hold is cleared |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is
