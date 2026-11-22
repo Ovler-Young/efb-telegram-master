@@ -190,39 +190,91 @@ While the bot runs, only `/confirm_send` ends a hold (and startup, for the
 `history_failed` rows named above: when the queue opens, the schema migration
 clears only `history_failed:RequiredSenderUnavailableError` on a history row
 that never started an attempt). The bot never removes a held row or its media by
-itself. A held row that can never be sent is removed offline:
+itself. A held row that can never be sent is cleared offline. It is removed;
+or, for a row found not delivered, its caption is sent as text when its media
+file is gone, or the row is sent again when it was held after a timeout and its
+files are still there:
 
 ```sh
 python -m efb_telegram_master.clear_unsendable --data-dir /channel/data
-python -m efb_telegram_master.clear_unsendable --data-dir /channel/data --apply
+python -m efb_telegram_master.clear_unsendable --data-dir /channel/data \
+    --not-delivered not-delivered.txt --apply
 ```
 
 Without `--apply` it only prints counts. With a PostgreSQL queue, add `--config`
 with the bot's `database` settings, as for `hold_send`. It refuses while a bot
 owns the queue (the data directory's lock files, or the PostgreSQL queue's
-session lock), so stop EFB first. It decides from the rows and files present
-when it runs and removes:
+session lock), so stop EFB first. It never sends anything itself and decides
+from the rows and files present when it runs. These rows are removed:
 
 | Reason | Row |
 |---|---|
-| `missing_media` | Held; an external media file it names (a local path or `file://` URI, such as a file staged for a local Bot API server) is gone. Web URLs are fetched again on replay and do not count. |
-| `missing_sidecar` | Held; a queue-owned file it names in `outbound-media/` is gone. |
+| `missing_media` | Held; an external media file it names (a local path or `file://` URI, such as a file staged for a local Bot API server) is gone. Web URLs are fetched again on replay and do not count. A listed row with a caption may send its caption instead (below). |
+| `missing_sidecar` | Held; a queue-owned file it names in `outbound-media/` is gone. A listed row with a caption may send its caption instead (below). |
 | `invalid_payload` | Held as `invalid_payload`. |
-| `rejected_batch` | Held as `aggregation_failed:BadRequest`: Telegram rejected the batch. |
+| `rejected_batch` | Held as `aggregation_failed:BadRequest`: Telegram rejected the batch. It is removed even when listed, never sent again. |
 | `needs_removed_row` | Held or waiting edit of a container that does not exist yet (a `member_update` without `container_id`, see [Ordering links](#ordering-links)): the removed row would have created it. Repeated for edits that wait on such an edit in turn. |
 
-It never removes an `in_flight` or `sent_pending` row or an unrecognized hold,
-and it does not look for the message in the chat: if a removed row had in fact
-been delivered, that message keeps no MsgLog mapping, as for a send nobody
-confirmed. Every other row keeps its stored
-bytes; a link to a removed row becomes void, so a row that was only ordered
-behind it is ready. A queue-owned file of a removed row is deleted when no
-remaining row names it; while any remaining row's media cannot be read, all
-files are kept. External media files are never deleted. The output has counts
-only: all rows, removed rows by reason and by operation, kept rows, kept rows
-that were ordered behind a removed row (`released`), and deleted files. To undo
-`--apply`, restore the queue (`outbound-queue.sqlite3` and `outbound-media/`, or
-the PostgreSQL queue tables) from a backup taken before it.
+`--not-delivered` names a text file of queue row ids, one per line: the held
+rows found not delivered, checked against the chat just before the clear. The
+tool itself does not look in the chat. Only listed rows are sent, in two ways:
+
+* **Caption as text.** A held send of one media file (`send_photo`,
+  `send_video`, `send_document` and the like) whose file is gone and whose
+  caption has text from the sender becomes a text send of its caption
+  (`caption_sent_as_text`). When the chat shows a sender header, a stored
+  caption starts with it: a line ending in `:` followed by a newline. For a
+  message without text the header is followed by nothing or by the bot's own
+  placeholder for the media (the `default_media_prompt` emoji or text, in any
+  of the bot's languages). Such a caption, the header (ignoring formatting)
+  with only that placeholder or nothing after it, is not sent: the row is
+  removed and counted as `caption_header_only`. A caption without a header
+  line, such as a one-line text of the sender that ends in `:`, is the
+  sender's text and is sent.
+* **Sent again.** A send held as uncertain after a timeout or a cut connection
+  (`uncertain:TimedOut...` or `uncertain:NetworkError...`) whose media files
+  are all still there is released unchanged (`resend`): its hold, attempt and
+  failure count are cleared and the bot sends it on its next start. An
+  operator hold and a row without media are not released.
+
+Every other row whose file is gone is removed, including a delivered one, whose
+caption is already in the chat; such an unlisted removed row with a caption is
+counted as `caption_not_sent`. Every other held row stays held. Without
+`--not-delivered`, nothing is sent, every row whose file is gone is removed, and
+the output says so. Ids in the file that do not name such a row change nothing.
+A member of a text batch (an aggregation context other than `boundary`) is
+neither converted nor released: it is built again from its batch when sent. A
+listed member that would otherwise be sent again stays held and is counted as
+`resend_batch_member`.
+Take the list after the bot's last stop and do not reuse it once the bot has run: a
+send released once that timed out again would be released again by the same list.
+A full-content attachment's caption only announces the file, so that row is
+removed.
+
+A row that sends its caption keeps its id, chat, topic, position and MsgLog
+context; its request becomes `send_message` with the caption as `text` and the
+caption's formatting, reply and buttons, without the file or the options only
+media take. Its hold is cleared and it must be sent by the bot that attempted it
+(`required_sender_bot_id`; the main bot when no auxiliary bot did). A row sent
+again keeps its stored request and sender. Both are sent through the normal
+queue and mapped in MsgLog like any sent row; rows ordered behind them wait for
+them again.
+
+It never clears an `in_flight` or `sent_pending` row or an unrecognized hold.
+If a removed row had in fact been delivered, that message keeps no MsgLog
+mapping, as for a send nobody confirmed; if a listed row had in fact been
+delivered, its caption, or the whole message, is sent a second time. Every
+other row keeps its stored bytes; a link to a removed row becomes void, so a
+row that was only ordered behind it is ready. A queue-owned file of a removed
+row, or of a row that now sends only its caption, is deleted when no remaining
+row names it; while any remaining row's media cannot be read, all files are
+kept. External media files are never deleted. The output has counts only: all
+rows, removed rows by reason and by operation, `caption_sent_as_text`,
+`caption_header_only`, `caption_not_sent`, `resend`, `resend_batch_member`,
+kept rows (including those sending a caption or sent again), kept rows that
+were ordered behind a removed row (`released`), and deleted files. To undo `--apply`, restore the queue
+(`outbound-queue.sqlite3` and `outbound-media/`, or the PostgreSQL queue tables)
+from a backup taken before it.
 
 A new row is written as waiting by `OutboundQueue.enqueue_many`, the aggregation
 handoff and the supplement insert; it has no earlier state to check, so the table
@@ -246,6 +298,8 @@ below lists only events on an existing row.
 | remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
 | discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
+| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send whose file is gone and whose caption has text from the sender (above) |
+| resend | uncertain | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send held after a timeout or a cut connection whose files are all there (above) |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is

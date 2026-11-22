@@ -878,13 +878,7 @@ class SlaveMessageProcessor(LocaleMixin):
         if msg.text:
             text = self.html_substitutions(msg)
         elif msg_template:
-            placeholder_flag = self.flag("default_media_prompt")
-            if placeholder_flag == "emoji":
-                text = "🖼️"
-            elif placeholder_flag == "text":
-                text = self._("Sent a picture.")
-            else:
-                text = ""
+            text = utils.media_prompt("picture", self.flag("default_media_prompt"), self._)
         else:
             text = ""
 
@@ -1251,13 +1245,7 @@ class SlaveMessageProcessor(LocaleMixin):
         if msg.text:
             text = self.html_substitutions(msg)
         elif msg_template:
-            placeholder_flag = self.flag("default_media_prompt")
-            if placeholder_flag == "emoji":
-                text = "📄"
-            elif placeholder_flag == "text":
-                text = self._("Sent a file.")
-            else:
-                text = ""
+            text = utils.media_prompt("file", self.flag("default_media_prompt"), self._)
         else:
             text = ""
 
@@ -1463,13 +1451,7 @@ class SlaveMessageProcessor(LocaleMixin):
         if msg.text:
             text = self.html_substitutions(msg)
         elif msg_template:
-            placeholder_flag = self.flag("default_media_prompt")
-            if placeholder_flag == "emoji":
-                text = "🎥"
-            elif placeholder_flag == "text":
-                text = self._("Sent a video.")
-            else:
-                text = ""
+            text = utils.media_prompt("video", self.flag("default_media_prompt"), self._)
         else:
             text = ""
         try:

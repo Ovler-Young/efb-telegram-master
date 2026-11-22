@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import urllib.parse
+from collections.abc import Callable
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tempfile import NamedTemporaryFile
@@ -135,6 +136,21 @@ OldMsgID = Tuple[TelegramChatID, TelegramMessageID]
 # TelegramMessageID = Union[str, int]
 # TgChatMsgIDStr = str
 # EFBChannelChatIDStr = str
+
+
+# The line that stands for a media file sent without text, as an emoji.
+MEDIA_PROMPT_EMOJI = {"picture": "🖼️", "file": "📄", "video": "🎥"}
+
+
+def media_prompt(kind: str, setting: str, gettext: Callable[[str], str]) -> str:
+    """The line that stands for a picture, file or video sent without text,
+    per the ``default_media_prompt`` setting; empty when it is disabled."""
+    if setting == "emoji":
+        return MEDIA_PROMPT_EMOJI[kind]
+    if setting == "text":
+        return {"picture": gettext("Sent a picture."), "file": gettext("Sent a file."),
+                "video": gettext("Sent a video.")}[kind]
+    return ""
 
 
 class ExperimentalFlagsManager(LocaleMixin):
