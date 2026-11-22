@@ -81,12 +81,12 @@ def _rows(directory, database, where="TRUE", columns="*"):
             for row in rows}
 
 
-def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, monkeypatch, make_queue, queue_backend):
+def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, queue_backend):
     staged = tmp_path / "bot-api"
     staged.mkdir()
-    gone, present, captioned_file, untexted_file = (
-        staged / name for name in ("gone.mp4", "present.mp4", "captioned.mp4", "untexted.mp4"))
-    for path in (gone, present, captioned_file, untexted_file):
+    gone, present, captioned_file, unlisted_file, untexted_file = (
+        staged / name for name in ("gone.mp4", "present.mp4", "captioned.mp4", "unlisted.mp4", "untexted.mp4"))
+    for path in (gone, present, captioned_file, unlisted_file, untexted_file):
         path.write_bytes(b"gif")
     data = tmp_path / "data"
     queue = make_queue(data)
@@ -113,12 +113,14 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, monkeypatch, m
     kept_media = _add(queue, "send_document", {"chat_id": -1001, "document": present.as_uri()},
                       cleanup=(str(present),))
     kept_text = _add(queue, "send_message", {"chat_id": -1001, "text": "text"})
-    # A gone file of a message with text: held until chosen, then its caption is sent as text.
+    # A gone file of a message with text: its caption is sent as text only when the row is listed as not delivered.
     caption = {"chat_id": -1004, "caption": "<b>Author:</b>\nmessage", "parse_mode": "HTML", "message_thread_id": 7}
     log = encode(message_with_group(), None)
     captioned = _add(queue, "send_video", {**caption, "video": captioned_file.as_uri(), "thumbnail": b"thumb",
                                            "duration": 3, "has_spoiler": True}, cleanup=(str(captioned_file),),
                      context=_context("boundary", legacy_context=log))
+    unlisted = _add(queue, "send_video", {**caption, "video": unlisted_file.as_uri()}, cleanup=(str(unlisted_file),),
+                    context=log)
     # A message without text has only the sender's name and a placeholder as caption: removed.
     untexted = message_with_group()
     untexted.text = ""
@@ -128,10 +130,10 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, monkeypatch, m
     after_caption = _add(queue, "send_message", {"chat_id": -1004, "text": "after"}, predecessor=captioned)
     for row_id, error in ((gone_media, TimedOut()), (rejected, BadRequest("Message is too long")),
                           (edit, TimedOut()), (source, TimedOut()), (kept_media, TimedOut()),
-                          (captioned, TimedOut()), (header_only, TimedOut())):
+                          (captioned, TimedOut()), (unlisted, TimedOut()), (header_only, TimedOut())):
         _hold(queue, row_id, error)
     _copy_payload(queue, source, rejected)  # A removed row and a kept row name one file.
-    for path in (gone, captioned_file, untexted_file):
+    for path in (gone, captioned_file, unlisted_file, untexted_file):
         path.unlink()
     queue.close()
     before = _rows(data, queue_backend)
@@ -139,30 +141,29 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, monkeypatch, m
     before_unchanged = _rows(data, queue_backend, columns=unchanged)[captioned]
     files = set(queue.media_dir.iterdir())
 
-    expected = {"missing_media": 2, "rejected_batch": 1, "needs_removed_row": 1}
+    # Without a list of rows not delivered, no caption is sent: every gone-file row is removed.
     report = clear(data, database=queue_backend)
-    assert report["removed"] == expected and report["released"] == 4 and report["media_files_removed"] == 1
-    assert report["captioned_waiting_for_choice"] == 1 and report["caption_sent_as_text"] == 0
-    assert not report["applied"]
+    assert report["removed"] == {"missing_media": 4, "rejected_batch": 1, "needs_removed_row": 1}
+    assert report["caption_sent_as_text"] == 0 and report["caption_not_sent"] == 2 and report["released"] == 5
+    assert report["media_files_removed"] == 2 and not report["applied"]
     assert _rows(data, queue_backend) == before and set(queue.media_dir.iterdir()) == files
 
-    report = clear(data, apply=True, database=queue_backend)
-    assert report["removed"] == expected and report["kept"] == 8 and report["media_files_removed"] == 1
-    # Only the removed row's own file went; the files of kept rows stay.
-    assert len(files - set(queue.media_dir.iterdir())) == 1 and present.exists()
-    removed = {gone_media, rejected, update, header_only}
-    assert _rows(data, queue_backend) == {row_id: row for row_id, row in before.items() if row_id not in removed}
-    # A held row defers nothing, so the row behind the waiting caption is ready.
-    assert set(_rows(data, queue_backend, ready_sql("q"))) == {append, behind, kept_text, after_caption}
-
-    monkeypatch.setattr("efb_telegram_master.clear_unsendable._send_caption", lambda row_id, hold: True)
-    report = clear(data, apply=True, database=queue_backend)
-    assert report["removed"] == {} and report["caption_sent_as_text"] == 1 and report["media_files_removed"] == 1
+    # A listed row whose message has no text is still removed, and so is a captioned row that is not listed.
+    listed = tmp_path / "not-delivered.txt"
+    listed.write_text(f"{captioned}\n{header_only}\n")
+    report = clear(data, apply=True, database=queue_backend, not_delivered=listed)
+    assert report["removed"] == {"missing_media": 3, "rejected_batch": 1, "needs_removed_row": 1}
+    assert report["caption_sent_as_text"] == 1 and report["caption_not_sent"] == 1
+    assert report["kept"] == 8 and report["released"] == 4 and report["media_files_removed"] == 2
+    # Only the files of the removed row and of the converted row went; the file a kept row still names stays.
+    assert len(files - set(queue.media_dir.iterdir())) == 2 and present.exists()
+    removed = {gone_media, rejected, update, header_only, unlisted}
     rows = _rows(data, queue_backend)
     assert rows.pop(captioned) != before[captioned]
     assert rows == {row_id: row for row_id, row in before.items() if row_id not in removed | {captioned}}
     # Once the caption is a send again, the row behind it waits for it.
-    assert set(_rows(data, queue_backend, ready_sql("q"))) == {append, behind, kept_text, captioned}
+    ready = set(_rows(data, queue_backend, ready_sql("q")))
+    assert ready == {append, behind, kept_text, captioned} and after_caption not in ready
     # The same chat, topic, text and formatting, without the video, from the bot that attempted it, in its place.
     assert _rows(data, queue_backend, columns=unchanged)[captioned] == before_unchanged
     operation, payload, sender = _rows(data, queue_backend, columns="operation, payload, required_sender_bot_id")[
