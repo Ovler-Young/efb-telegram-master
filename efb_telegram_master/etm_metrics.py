@@ -20,7 +20,8 @@ _REMOVAL_OUTCOMES = frozenset({"submitted", "terminal_discard", "cancelled", "re
 _COMPLETION_OUTCOMES = frozenset({"success", "failure"})
 _DISPATCH_OUTCOMES = frozenset({"submitted", "deferred", "failed"})
 _RETRY_REASONS = frozenset(
-    {"rate_limit", "local_limit", "membership", "migration", "transport", "worker_capacity", "acquisition"}
+    {"rate_limit", "local_limit", "membership", "migration", "transport", "worker_capacity", "acquisition",
+     "unconfirmed_edit"}
 )
 _FAILURE_STAGES = frozenset({"dispatch", "execution", "terminal", "uncertain"})
 _AUXILIARY_STATES = frozenset({"enabled", "disabled"})

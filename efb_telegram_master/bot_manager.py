@@ -54,7 +54,10 @@ from .outbound import (
     OutboundQueue,
     OutboundQueueScheduler,
     QUEUED_OPERATIONS,
+    EDIT_OPERATIONS,
     RETAINED_OPERATIONS,
+    UNCONFIRMED_EDIT_RETRY,
+    telegram_error_text,
     transport_definitely_not_sent,
     IllegalAggregationTransitionError,
     QueueEnqueueError,
@@ -1811,6 +1814,36 @@ class TelegramBotManager(LocaleMixin):
                                        chat=telegram.Chat(key[1], "supergroup"),
                                        text=context["aggregate"]["confirmed_text"],
                                        message_thread_id=int(key[2]) if key[2] is not None else None)
+            if (row.operation in EDIT_OPERATIONS and "message is not modified" in str(error).lower()
+                    and self._outbound_queue.edit_unconfirmed(row.id)):
+                # Telegram applied the earlier try of this edit and only its answer was lost.
+                if row.operation == "edit_message_caption":
+                    # Its message log needs the media from Telegram's answer, so
+                    # the row stays held for the operator.
+                    raise InvalidTelegramResponseError(
+                        "Telegram applied an earlier try of this caption edit; its answer was lost."
+                    ) from error
+                from datetime import datetime, timezone
+                text, _ = self._queued_content_argument(telegram_args, telegram_kwargs, "text", 0)
+                edit_chat_id = self._normalize_telegram_chat_id(
+                    self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs)
+                )
+                message_id = OutboundQueue.edited_message_id(row.operation, row.payload)
+                if message_id is None:
+                    raise InvalidTelegramResponseError(
+                        "Telegram applied an earlier try of this edit; its message ID is unknown."
+                    ) from error
+                receipt = TelegramMessage(
+                    message_id=message_id,
+                    date=datetime.now(timezone.utc), chat=telegram.Chat(edit_chat_id, "supergroup"),
+                    text=text, message_thread_id=row.thread_id)
+                if content is None:
+                    return receipt
+                # A long edit still sends its full text as an attachment.
+                full_args, full_kwargs = self._rewrite_queued_chat_id(
+                    row.operation, full_args, full_kwargs, edit_chat_id
+                )
+                return self._queued_completion_result(row, full_args, full_kwargs, receipt, selection)
             replay = kwargs.get(HISTORY_REPLAY_KEY)
             # Only an explicit negative acknowledgment permits a second send.
             # A missing response or timeout must keep using delivery uncertainty.
@@ -2162,6 +2195,18 @@ class TelegramBotManager(LocaleMixin):
             and not isinstance(error, telegram.error.BadRequest)
             and not transport_definitely_not_sent(error)
         )
+        from .queued_log import decode_aggregation
+        context = decode_aggregation(row.log_context) if operation in EDIT_OPERATIONS and row.log_context else None
+        # An edit that appends new messages to a combined message is their only
+        # copy: it is held like a send.
+        if operation in EDIT_OPERATIONS and ambiguous_network and not (context and context.get("members")):
+            # Repeating an edit over the same text is harmless; holding it would
+            # leave an old edit that can never be replayed safely over newer text.
+            return QueuedCompletionDecision(
+                QueuedCompletionKind.RETRY_EVENTUAL,
+                time.monotonic() + self.TRANSPORT_RETRY_SECONDS,
+                UNCONFIRMED_EDIT_RETRY,
+            )
         # No response is not a negative acknowledgment. Retain the log and media,
         # and never let a restart turn an unknown result into another remote send.
         if isinstance(error, InvalidTelegramResponseError) or operation in RETAINED_OPERATIONS and (
@@ -2169,11 +2214,12 @@ class TelegramBotManager(LocaleMixin):
             or (type(error) is telegram.error.TelegramError and isinstance(error.__cause__, ValueError))
         ):
             self.logger.error(
-                "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s). "
+                "Telegram delivery unconfirmed for queue row %s (%s, sender=%s, error=%s/%s, telegram=%r). "
                 "Row, media and MsgLog context retained; automatic resend disabled. "
                 "Confirm an existing Telegram message before resolving this row.",
                 row.id, operation, selection.sender_bot_id or "main",
                 type(error).__name__, type(error.__cause__).__name__ if error.__cause__ else "none",
+                telegram_error_text(error),
             )
             return QueuedCompletionDecision(QueuedCompletionKind.DELIVERY_UNCERTAIN)
 

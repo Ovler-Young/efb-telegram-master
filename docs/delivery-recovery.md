@@ -2,11 +2,16 @@
 
 A timeout or disconnected HTTP response is not proof that Telegram rejected a
 message. The remote side may have accepted it. Message-creating queue operations
-now persist `delivery_hold='in_flight'` before executor submission. The hold is
-cleared only for a definite rejection/pre-send connection failure, or by saving
-an actual completion receipt. An interrupted attempt stays held across restarts.
-An ambiguous failure is stored as `uncertain:<exception-class>/<cause-class>`.
-No request objects, tokens or exception tracebacks are persisted in this field.
+and text/caption edits persist `delivery_hold='in_flight'` before executor
+submission. The hold is cleared only for a definite rejection/pre-send connection
+failure, or by saving an actual completion receipt. An interrupted attempt stays
+held across restarts. An ambiguous failure of a send is stored as
+`uncertain:<exception-class>/<cause-class>`. Whenever a row is held after a
+Telegram error (uncertain or rejected), the error's text is kept next to the hold
+in `hold_reason`, cut to 200 characters: Telegram's description for a rejection,
+such as `Chat not found`, or the transport's, such as `Timed out`. Other
+exceptions leave it empty. No message contents, request objects, tokens or exception
+tracebacks are stored in either column.
 
 Held rows keep their payload, sidecar and original MsgLog context. They are not
 silently marked sent. Other runnable rows, including newer
@@ -14,6 +19,30 @@ messages to the same chat, continue. Definite RetryAfter rejections still retry
 at the requested deadline. ConnectError/ConnectTimeout/PoolTimeout causes are
 also retryable because the HTTP request was not sent. Read/write failures and
 unknown network outcomes are not blindly retried for message-creating calls.
+
+A text or caption edit (`edit_message_text`, `edit_message_caption`) whose
+result is ambiguous for the same reasons is not held, unless it appends new
+messages to an aggregated container: that edit is their only copy, so it is held
+like a send. Repeating any other edit over the same text is harmless, while
+replaying an old edit over newer text is not. So the edit is released and tried
+once more after the transport retry delay, still ahead of the later rows of its
+chat and topic. If Telegram answers that try with "message is not modified", the
+earlier try was applied: a text edit is completed as delivered and its MsgLog
+update is written. A caption edit is held as
+`uncertain:InvalidTelegramResponseError/BadRequest` instead, because only
+Telegram's answer would tell MsgLog the message's media. The edit is dropped, and
+its MsgLog update with it, when a later queued row edits the same message with its
+complete text (an edit made in the bot or a source-side edit of a standalone
+message), or when Telegram did not confirm an earlier try of it either. That
+earlier try is recorded in `unconfirmed_at`, so a second ambiguous result drops
+the edit after a restart too. A try refused before it reached Telegram (a
+connection failure) is retried as usual and does not count. A later update of an
+aggregated container does not count as a newer edit. It is built from the
+confirmed container and does not carry this edit's content, so the older edit
+gets its second try first. The log shows `Telegram did not confirm the edit ...
+trying it once more` or `... dropped because ...`. A blocking caller of a dropped
+edit gets the transport error. An edit interrupted by a restart stays
+`in_flight`, like a send.
 
 This is not an exactly-once transport guarantee: after loss of the response,
 remote success requires evidence. No increasing retry count, arbitrary file-size
@@ -152,8 +181,10 @@ original bot. Edit/delete routing continues to use the actual author.
 ## Diagnostics and streaming
 
 `etm_outbound_failures_total{stage="uncertain"}` counts newly detected ambiguous
-results. A healthy worker can coexist with held records; queue depth alone does
-not mean that those records are awaiting a safe automatic retry.
+results of sends. A retried edit counts as a retry with reason `unconfirmed_edit`,
+and a dropped edit as a `terminal` failure. A healthy worker can coexist with held
+records; queue depth alone does not mean that those records are awaiting a safe
+automatic retry.
 
 Aggregation recovery and source lookups read `log_context` and ordering only;
 `aggregation_rows()` returns no payload bytes, so a large legacy inline media
@@ -187,12 +218,16 @@ LIMIT 20;
 ```
 
 ```sql
-SELECT id, operation, telegram_chat_id, delivery_state, delivery_hold,
+SELECT id, operation, telegram_chat_id, delivery_state, delivery_hold, hold_reason,
        attempt_sender_bot_id, attempt_started_at,
        completion_receipt IS NOT NULL AS has_receipt
 FROM outbound_queue
 WHERE delivery_hold IS NOT NULL;
 ```
+
+`python -m efb_telegram_master.queue_report` lists held rows grouped by hold and
+Telegram's error text (`held rows: Telegram's error text`) and prints
+`hold_reason` in a single row's details.
 
 Startup sweeps unreferenced media sidecars only for a queue of at most
 `MAX_ORPHAN_SCAN_ROWS` rows, because the sweep opens one blob reader per
@@ -220,7 +255,15 @@ in the [text aggregation guide](text-aggregation.md).
 Every row of the outbound queue (the `outbound_queue` table, in `outbound-queue.sqlite3`
 on SQLite and in the same PostgreSQL schema as the message tables on PostgreSQL) is in
 exactly one state, read from its `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
-deferred row). On a queued row `reconcile_attempts` counts its failed attempts
+deferred row). `hold_reason` only explains a hold with the error's text, and
+`unconfirmed_at` only marks an edit whose earlier try Telegram did not confirm;
+neither decides a state. A queue written by an earlier version gains both
+columns when this version opens it (SQLite) or at database startup
+(PostgreSQL); rows from before then have them empty. An earlier version still
+runs on the upgraded queue and ignores the columns, but its `migrate_db` refuses to move an upgraded
+SQLite queue (`Unsupported columns`), so move a queue with the version that last
+ran the bot. Verify or finish a move with the version that started it: this
+version cannot verify a move made by a version without these columns. On a queued row `reconcile_attempts` counts its failed attempts
 in a row; from 3 on (`FAILED_ATTEMPTS_LIMIT`) it no longer holds back the rows
 ordered after it (see [Ordering links](#ordering-links)). The definition lives
 in `efb_telegram_master/delivery_states.py`: `RowState` (states), `HoldKind` (stored hold spellings), `Event`, `TRANSITIONS`
@@ -232,7 +275,7 @@ Stored spellings never change between versions.
 | waiting | `queued` / NULL | Will be sent when its destination's turn comes. | None. |
 | deferred | `queued` / NULL, `reconcile_after` ahead | Media acquisition failed before any send, or a send kept failing with a retryable error (a connection that never reached Telegram, a chat migration) for 3 attempts; retried after a backoff. Earlier failed sends are retried after a backoff the scheduler keeps in memory, and the row stays waiting. | None. |
 | in_flight | `queued` / `in_flight` | Attempt recorded before submission. After a restart it is an interrupted attempt that may have been delivered; opening the queue counts it as 3 failed attempts, so later rows no longer wait for it. | If delivered, `/confirm_send`; otherwise investigate. |
-| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result: Telegram may have accepted it. | With the chat check on, none: it confirms, sends again or discards the row. Otherwise, or for a row it leaves held, `/confirm_send` on the delivered message. |
+| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result of a send: Telegram may have accepted it. An edit is retried once or dropped instead, unless it appends new messages (see the top of this guide). | With the chat check on, none: it confirms, sends again or discards the row. Otherwise, or for a row it leaves held, `/confirm_send` on the delivered message. |
 | uncertain (operator) | `queued` / `uncertain:operator_observed_delivery` | Held offline by `hold_send` for a send already seen on Telegram. | `/confirm_send`; any configured bot is accepted. |
 | invalid_payload | `queued` / `invalid_payload` | The stored request cannot be decoded. Not evidence of delivery. | Investigate the row. |
 | history_failed | `queued` / `history_failed:<Class>` | History replay was rejected. Startup re-queues `RequiredSenderUnavailableError` rows that never started an attempt. | Investigate, or `/confirm_send` if it was delivered. |
