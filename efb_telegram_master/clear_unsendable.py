@@ -53,8 +53,8 @@ def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str 
         elif not (media_dir / reference.storage_name).is_file():
             return MISSING_SIDECAR
     if state is RowState.AGGREGATION_FAILED:
-        _kind, detail = parse_hold(hold)
-        if detail.split("/", 1)[0] == "BadRequest":
+        parsed = parse_hold(hold)
+        if parsed is not None and parsed[1].split("/", 1)[0] == "BadRequest":
             return REJECTED_BATCH
     return None
 
