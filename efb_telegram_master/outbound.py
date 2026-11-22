@@ -1627,24 +1627,25 @@ class OutboundQueue:
                 raise
         return args, kwargs
 
-    def _collect_media_references(self, value: object, found: list[_StoredMediaSnapshot]) -> None:
+    @classmethod
+    def _collect_media_references(cls, value: object, found: list[_StoredMediaSnapshot]) -> None:
         if isinstance(value, _StoredMediaSnapshot):
             found.append(value)
             return
         if isinstance(value, (tuple, list)):
             for item in value:
-                self._collect_media_references(item, found)
+                cls._collect_media_references(item, found)
             return
         if isinstance(value, dict):
             for item in value.values():
-                self._collect_media_references(item, found)
+                cls._collect_media_references(item, found)
             return
         if isinstance(value, InputMedia):
-            self._collect_media_references(value.media, found)
+            cls._collect_media_references(value.media, found)
             for field in _INPUT_MEDIA_ATTACHMENT_FIELDS.get(type(value), ()):
                 attachment = getattr(value, field, None)
                 if attachment is not None:
-                    self._collect_media_references(attachment, found)
+                    cls._collect_media_references(attachment, found)
 
     def _media_reference_keys(self, payload: bytes) -> frozenset[tuple[str, str]]:
         if not payload or payload[0] != 2:

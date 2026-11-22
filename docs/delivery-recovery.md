@@ -186,11 +186,43 @@ Stored spellings never change between versions.
 | sent_pending | `sent_pending` / NULL | Telegram receipt saved; the MsgLog write is retried with backoff. | None. |
 | absent | no row | Not yet enqueued, or removed. | None. |
 
-Only `/confirm_send` ends a hold (and startup, for the `history_failed` rows
-named above: when the queue opens, the schema migration clears only
-`history_failed:RequiredSenderUnavailableError` on a history row that never
-started an attempt). The bot never removes a held row or its media by itself: a
-row that was not delivered stays in the queue until an operator removes it.
+While the bot runs, only `/confirm_send` ends a hold (and startup, for the
+`history_failed` rows named above: when the queue opens, the schema migration
+clears only `history_failed:RequiredSenderUnavailableError` on a history row
+that never started an attempt). The bot never removes a held row or its media by
+itself. A held row that can never be sent is removed offline:
+
+```sh
+python -m efb_telegram_master.clear_unsendable --data-dir /channel/data
+python -m efb_telegram_master.clear_unsendable --data-dir /channel/data --apply
+```
+
+Without `--apply` it only prints counts. With a PostgreSQL queue, add `--config`
+with the bot's `database` settings, as for `hold_send`. It refuses while a bot
+owns the queue (the data directory's lock files, or the PostgreSQL queue's
+session lock), so stop EFB first. It decides from the rows and files present
+when it runs and removes:
+
+| Reason | Row |
+|---|---|
+| `missing_media` | Held; an external media file it names (a local path or `file://` URI, such as a file staged for a local Bot API server) is gone. Web URLs are fetched again on replay and do not count. |
+| `missing_sidecar` | Held; a queue-owned file it names in `outbound-media/` is gone. |
+| `invalid_payload` | Held as `invalid_payload`. |
+| `rejected_batch` | Held as `aggregation_failed:BadRequest`: Telegram rejected the batch. |
+| `needs_removed_row` | Held or waiting, and needs the Telegram message of a removed row (`needs_delivered_predecessor`, see [Ordering links](#ordering-links)); repeated for the rows that need it in turn. |
+
+It never removes an `in_flight` or `sent_pending` row or an unrecognized hold,
+and it does not look for the message in the chat: if a removed row had in fact
+been delivered, that message keeps no MsgLog mapping, as for a send nobody
+confirmed. Every other row keeps its stored
+bytes; a link to a removed row becomes void, so a row that was only ordered
+behind it is ready. A queue-owned file of a removed row is deleted when no
+remaining row names it; while any remaining row's media cannot be read, all
+files are kept. External media files are never deleted. The output has counts
+only: all rows, removed rows by reason and by operation, kept rows, kept rows
+that were ordered behind a removed row (`released`), and deleted files. To undo
+`--apply`, restore the queue (`outbound-queue.sqlite3` and `outbound-media/`, or
+the PostgreSQL queue tables) from a backup taken before it.
 
 A new row is written as waiting by `OutboundQueue.enqueue_many`, the aggregation
 handoff and the supplement insert; it has no earlier state to check, so the table
@@ -211,8 +243,9 @@ below lists only events on an existing row.
 | record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
 | operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
-| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held) |
+| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting row that needs a removed row's message |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
+| discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is

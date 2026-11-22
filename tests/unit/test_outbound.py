@@ -1864,6 +1864,8 @@ def test_every_written_row_state_accepts_exactly_its_transitions(tmp_path, spell
     _writers, stored, expected = ROW_SPELLINGS[spelling]
     mismatches = []
     for event in Event:
+        if event is Event.DISCARD:
+            continue  # Chosen by what a row stores, not called on one row: see test_clear_unsendable.
         directory = tmp_path / event.value
         queue = make_queue(directory)
         try:
