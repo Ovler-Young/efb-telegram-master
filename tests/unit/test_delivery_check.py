@@ -125,6 +125,20 @@ def test_message_edited_since_matches_on_other_keys_for_one_cluster_only():
     assert set(verdicts(run([keys(1), keys(2, "another text")], [edited])).values()) == {Verdict.AMBIGUOUS}
 
 
+def test_rows_in_different_clusters_never_share_one_message():
+    # captionless photos with different file names are separate clusters, but only one photo was delivered
+    rows = [keys(i, "", kind="photo", file_name=f"{name}.jpg") for i, name in enumerate("abc", 1)]
+    assert set(verdicts(run(rows, [seen(105, "", kind="photo")])).values()) == {Verdict.AMBIGUOUS}
+    found = run(rows[:2], [seen(105, "", kind="photo"), seen(106, "", kind="photo")])
+    assert verdicts(found) == {1: Verdict.FOUND, 2: Verdict.FOUND}
+    assert {found[1].message.id, found[2].message.id} == {105, 106}
+
+
+def test_edited_message_matched_on_text_by_one_cluster_is_not_claimed_by_another():
+    matched = seen(105, "hello", edited=True)
+    assert verdicts(run([keys(1), keys(2, "another text")], [matched])) == {1: Verdict.FOUND, 2: Verdict.AMBIGUOUS}
+
+
 def test_edit_is_applied_when_the_target_shows_its_text():
     rows = [keys(1, "first", kind="edit", target=50), keys(2, "second", kind="edit", target=50),
             keys(3, "third", kind="edit", target=50)]
@@ -174,7 +188,7 @@ def test_only_uncertain_holds_the_bot_made_are_checked(hold, expected):
 
 
 def document(attributes):
-    media = types.Document(id=1, access_hash=1, file_reference=b"", date=datetime.datetime.now(datetime.UTC),
+    media = types.Document(id=1, access_hash=1, file_reference=b"", date=datetime.datetime.now(datetime.timezone.utc),  # noqa: UP017 - datetime.UTC needs Python 3.11
                            mime_type="x/y", size=1, dc_id=1, attributes=attributes)
     return types.MessageMediaDocument(document=media)
 
@@ -188,7 +202,7 @@ def document(attributes):
     ([types.DocumentAttributeFilename(file_name="f.bin")], "document"),
 ])
 def test_message_kind_is_read_from_the_document(attributes, kind):
-    message = types.Message(id=5, peer_id=types.PeerChannel(1), date=datetime.datetime.now(datetime.UTC),
+    message = types.Message(id=5, peer_id=types.PeerChannel(1), date=datetime.datetime.now(datetime.timezone.utc),  # noqa: UP017 - datetime.UTC needs Python 3.11
                             message="", media=document(attributes), from_id=types.PeerUser(BOT))
     assert Seen.from_message(message).kind == kind
 
@@ -255,7 +269,7 @@ class RecordingClient:
 
 def real_message(message_id, text, date, author=BOT):
     return types.Message(id=message_id, peer_id=types.PeerChannel(1), message=text, from_id=types.PeerUser(author),
-                         date=datetime.datetime.fromtimestamp(date, datetime.UTC))
+                         date=datetime.datetime.fromtimestamp(date, datetime.timezone.utc))  # noqa: UP017 - datetime.UTC needs Python 3.11
 
 
 @pytest.fixture
@@ -315,6 +329,19 @@ def test_flood_wait_is_waited_out_and_the_read_retried(monkeypatch):
     reader = dc.BotReader(f"{BOT}:secret", 1, "h", client_factory=lambda: flooded)
     result = asyncio.run(reader.messages(CHAT, [7]))
     assert set(result) == {7} and reader.flood_waits == 1
+
+
+def test_calls_stay_paced_after_a_failed_call(monkeypatch):
+    monkeypatch.setattr(dc, "PACE", 1000.0)
+
+    class Refusing(RecordingClient):
+        async def get_input_entity(self, chat_id):
+            raise errors.ChannelPrivateError(request=None)
+
+    reader = dc.BotReader(f"{BOT}:secret", 1, "h", client_factory=lambda: Refusing({}))
+    with pytest.raises(dc.ChatUnreadable):
+        asyncio.run(reader.messages(CHAT, [7]))
+    assert reader._next_call - time.monotonic() > 900
 
 
 def test_thread_runs_a_pass_and_stop_disconnects(scenario, monkeypatch):

@@ -341,6 +341,7 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
     sends = [keys for keys in rows if keys.kind != "edit"]
     for members in _edit_chains(rows):
         chat_id, target = members[0].chat_id, members[0].target
+        assert target is not None   # an edit row always has its target
         if any(too_early(keys.attempt, now) for keys in members):
             out.update({keys.id: Decision(Verdict.TOO_EARLY) for keys in members})
             continue
@@ -353,6 +354,7 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
             out[keys.id] = Decision(Verdict.FOUND, message) if index <= applied else Decision(Verdict.NOT_FOUND)
 
     deferred = []
+    contenders: list[tuple[list[RowKeys], dict[int, list[Seen]]]] = []
     for cluster in _clusters(sends):
         if any(too_early(keys.attempt, now) for keys in cluster):
             out.update({keys.id: Decision(Verdict.TOO_EARLY) for keys in cluster})
@@ -361,20 +363,41 @@ def decide(rows: Sequence[RowKeys], spans: Mapping[int, Span], seen: Mapping[int
         found = {keys.id: _candidates(keys, spans[keys.id], chat, logged) for keys in cluster}
         strong = {keys.id: [s for s, is_strong in found[keys.id] if is_strong] for keys in cluster}
         if any(strong.values()):
-            taken = _assign(cluster, strong) if all(strong.values()) else None
-            for keys in cluster:
-                out[keys.id] = (Decision(Verdict.FOUND, taken[keys.id]) if taken
-                                else Decision(Verdict.AMBIGUOUS))
+            if all(strong.values()):
+                contenders.append((cluster, strong))
+            else:
+                out.update({keys.id: Decision(Verdict.AMBIGUOUS) for keys in cluster})
         elif any(found.values()):
             deferred.append((cluster, {keys.id: [s for s, _ in found[keys.id]] for keys in cluster}))
         else:
             for keys in cluster:
                 out[keys.id] = Decision(_missing(keys, spans[keys.id], chat, logged))
 
-    # A message edited since it was sent matches only on its other keys, so it may belong to one cluster only.
-    claims = collections.Counter(s.id for _, pools in deferred for pool in pools.values() for s in pool)
+    # Clusters that match the same message compete for it, so they are assigned together: a message is
+    # never the delivery of two rows.
+    groups: list[tuple[list[RowKeys], dict[int, list[Seen]], set[tuple[int, int]]]] = []
+    for cluster, pools in contenders:
+        claimed = {(cluster[0].chat_id, s.id) for pool in pools.values() for s in pool}
+        members, merged = list(cluster), dict(pools)
+        for other in [group for group in groups if group[2] & claimed]:
+            groups.remove(other)
+            members += other[0]
+            merged.update(other[1])
+            claimed |= other[2]
+        groups.append((members, merged, claimed))
+    for members, pools, _ in groups:
+        taken = _assign(members, pools)
+        for keys in members:
+            out[keys.id] = Decision(Verdict.FOUND, taken[keys.id]) if taken else Decision(Verdict.AMBIGUOUS)
+    taken_by_strong = set().union(*(group[2] for group in groups))
+
+    # A message edited since it was sent matches only on its other keys, so it may belong to one cluster only
+    # and not to a cluster that matched it on its text.
+    claims = collections.Counter((cluster[0].chat_id, s.id) for cluster, pools in deferred
+                                 for pool in pools.values() for s in pool)
     for cluster, pools in deferred:
-        contested = any(claims[s.id] > 1 for pool in pools.values() for s in pool)
+        contested = any(claims[(cluster[0].chat_id, s.id)] > 1 or (cluster[0].chat_id, s.id) in taken_by_strong
+                        for pool in pools.values() for s in pool)
         taken = None if contested or not all(pools.values()) else _assign(cluster, pools)
         for keys in cluster:
             out[keys.id] = Decision(Verdict.FOUND, taken[keys.id]) if taken else Decision(Verdict.AMBIGUOUS)
@@ -409,14 +432,15 @@ class BotReader:
             delay = self._next_call - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+            wait = PACE
             try:
                 self.calls += 1
-                result = await call()
-                self._next_call = time.monotonic() + PACE
-                return result
+                return await call()
             except errors.FloodWaitError as error:
                 self.flood_waits += 1
-                self._next_call = time.monotonic() + error.seconds + FLOOD_EXTRA
+                wait = error.seconds + FLOOD_EXTRA
+            finally:
+                self._next_call = time.monotonic() + wait
 
     async def _connected(self):
         if self._client is None:
@@ -521,19 +545,21 @@ class HeldSendCheck:
         finally:
             try:
                 loop.run_until_complete(self._close_readers())
-            except Exception:
-                logger.exception("Held-send check could not close its sessions.")
+            except Exception as error:  # noqa: BLE001 - only the class name is logged
+                logger.warning("Held-send check could not close its sessions: %s", type(error).__name__)
             loop.close()
 
     async def _wait(self, seconds: float) -> bool:
         """True when the check was asked to stop before ``seconds`` passed."""
+        assert self._stopping is not None
         try:
             await asyncio.wait_for(self._stopping.wait(), seconds)
             return True
-        except TimeoutError:
+        except asyncio.TimeoutError:  # noqa: UP041 - a different class from the builtin before Python 3.11
             return False
 
     async def _main(self) -> None:
+        assert self._stopping is not None
         delay = FIRST_PASS_DELAY
         while not await self._wait(delay):
             task = asyncio.ensure_future(self.run_pass())
@@ -630,6 +656,7 @@ class HeldSendCheck:
             keys = row_keys(row, reader.bot_id)
             if keys is None:
                 counts["undecodable"] += 1
+                assert row.attempt_started_at is not None   # only rows with an attempt time are eligible
                 self._done.add((row.id, row.attempt_started_at))
             else:
                 keyed[row.id] = (row, keys)
@@ -643,10 +670,11 @@ class HeldSendCheck:
         asked: dict[int, set[int]] = collections.defaultdict(set)
         spans: dict[int, Span] = {}
         usable: list[RowKeys] = []
-        targets = collections.defaultdict(set)
+        targets: dict[int, set[int]] = collections.defaultdict(set)
         for group in groups:
-            if group[0].kind == "edit":
-                targets[group[0].chat_id].add(group[0].target)
+            target = group[0].target
+            if group[0].kind == "edit" and target is not None:
+                targets[group[0].chat_id].add(target)
         unreadable_chats: set[int] = set()
         for chat_id, ids in targets.items():
             ordered = sorted(ids)
@@ -663,11 +691,12 @@ class HeldSendCheck:
                     usable.extend(group)
                 continue
             placed = [self._span(keyed[keys.id][0], keys) for keys in group]
-            if None in placed:
+            located = [where for where in placed if where is not None]
+            if len(located) < len(placed):
                 counts["no_neighbours"] += 1
                 continue
             try:
-                for keys, where in zip(group, placed, strict=True):
+                for keys, where in zip(group, located, strict=True):
                     spans[keys.id] = await self._fill(reader, store, asked, keys, *where)
             except ChatUnreadable:
                 counts["chat_unreadable"] += 1
