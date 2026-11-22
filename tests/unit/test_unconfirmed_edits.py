@@ -9,7 +9,11 @@ from telegram import Chat, Message
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from efb_telegram_master.db_runtime import postgresql_connection
-from efb_telegram_master.outbound import DeliveryUncertainError, QueueRequest, create_postgresql_queue_tables
+from efb_telegram_master.outbound import (
+    DeliveryUncertainError,
+    QueueRequest,
+    create_postgresql_queue_tables,
+)
 from efb_telegram_master.queued_log import encode_aggregation
 from tests.unit.test_delivery_uncertainty import (
     accepted_then_lost_response,
@@ -181,6 +185,33 @@ def test_an_applied_caption_edit_whose_answer_was_lost_stays_held(tmp_path, make
     assert len(attempts) == 2
     assert _row(queue, row_id)[:2] == ("uncertain:InvalidTelegramResponseError/BadRequest", "Message is not modified")
     assert isinstance(waiter.exception(timeout=1), DeliveryUncertainError)
+    queue.close()
+
+
+def test_a_long_edit_applied_without_an_answer_still_sends_its_full_text(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    long_text = "x" * 5000
+    row_id, _ = _edit(queue, long_text)
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    attempts = []
+    lost = accepted_then_lost_response(attempts)
+
+    def not_modified(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise BadRequest("Bad Request: message is not modified")
+
+    replies = iter([lost, not_modified])
+    manager._bot = SimpleNamespace(edit_message_text=lambda *args, **kwargs: next(replies)(*args, **kwargs))
+    _run(manager, passes=2)
+    assert len(attempts) == 2
+    assert _row(queue, row_id) is None
+    rows = queue.connection.execute("SELECT id, operation FROM outbound_queue").fetchall()
+    assert [operation for _id, operation in rows] == ["send_document"]
+    _args, document = queue.decode_payload(queue.connection.execute(
+        "SELECT payload FROM outbound_queue WHERE id=?", (rows[0][0],)).fetchone()[0])
+    assert document["document"].input_file_content.read() == long_text.encode("utf-8")
+    assert document["reply_to_message_id"] == 100
     queue.close()
 
 

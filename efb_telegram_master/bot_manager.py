@@ -1758,12 +1758,18 @@ class TelegramBotManager(LocaleMixin):
                     ) from error
                 from datetime import datetime, timezone
                 text, _ = self._queued_content_argument(telegram_args, telegram_kwargs, "text", 0)
-                return TelegramMessage(
+                chat_id = self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs)
+                receipt = TelegramMessage(
                     message_id=OutboundQueue.edited_message_id(row.operation, row.payload),
-                    date=datetime.now(timezone.utc),
-                    chat=telegram.Chat(self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs),
-                                       "supergroup"),
+                    date=datetime.now(timezone.utc), chat=telegram.Chat(chat_id, "supergroup"),
                     text=text, message_thread_id=row.thread_id)
+                if content is None:
+                    return receipt
+                # A long edit still sends its full text as an attachment.
+                full_args, full_kwargs = self._rewrite_queued_chat_id(
+                    row.operation, full_args, full_kwargs, self._normalize_telegram_chat_id(chat_id)
+                )
+                return self._queued_completion_result(row, full_args, full_kwargs, receipt, selection)
             replay = kwargs.get(HISTORY_REPLAY_KEY)
             # Only an explicit negative acknowledgment permits a second send.
             # A missing response or timeout must keep using delivery uncertainty.
