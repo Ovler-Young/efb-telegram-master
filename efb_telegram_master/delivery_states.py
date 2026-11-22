@@ -92,6 +92,7 @@ class Event(Enum):
     DEFER_RECONCILIATION = "defer_reconciliation"
     REMOVE = "remove"
     WITHDRAW = "withdraw"
+    DISCARD = "discard"
 
 
 def _from(states, event: Event, target: RowState) -> dict:
@@ -123,6 +124,9 @@ TRANSITIONS: dict[tuple[RowState, Event], RowState] = {
     # Cancelling an empty batch or a pending source, or splitting a batch into
     # rows that replace it, removes only a row no attempt has started on.
     **_from(_ATTEMPTABLE, Event.WITHDRAW, RowState.ABSENT),
+    # An operator removes a held row that can never be sent. A hold another
+    # version wrote is left to that version.
+    **_from(HELD_STATES - {RowState.UNRECOGNIZED_HOLD}, Event.DISCARD, RowState.ABSENT),
 }
 
 
