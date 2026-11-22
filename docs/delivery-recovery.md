@@ -248,10 +248,9 @@ at startup for the `history_failed` rows named above (when the queue opens, the
 schema migration clears only `history_failed:RequiredSenderUnavailableError` on
 a history row that never started an attempt). Apart from the chat check, the bot
 never removes a held row or its media by itself. A held row that can never be
-sent is cleared offline. It is removed;
-or, for a row found not delivered, its caption is sent as text when its media
-file is gone, or the row is sent again when it was held after a timeout and its
-files are still there:
+sent is cleared offline. It is removed; or, for a row found not delivered, its
+caption is sent as text when its media file is gone, or the row is sent again
+when it was held after a timeout and its files are still there:
 
 ```sh
 python -m efb_telegram_master.clear_unsendable --data-dir /channel/data
@@ -330,9 +329,9 @@ kept. External media files are never deleted. The output has counts only: all
 rows, removed rows by reason and by operation, `caption_sent_as_text`,
 `caption_header_only`, `caption_not_sent`, `resend`, `resend_batch_member`,
 kept rows (including those sending a caption or sent again), kept rows that
-were ordered behind a removed row (`released`), and deleted files. To undo `--apply`, restore the queue
-(`outbound-queue.sqlite3` and `outbound-media/`, or the PostgreSQL queue tables)
-from a backup taken before it.
+were ordered behind a removed row (`released`), and deleted files. To undo
+`--apply`, restore the queue (`outbound-queue.sqlite3` and `outbound-media/`, or
+the PostgreSQL queue tables) from a backup taken before it.
 
 To list the held sends that the chats show were not delivered, for the clear
 tool's `--not-delivered` file, run the chat check once, read-only, while the bot

@@ -14,8 +14,8 @@ all still there is sent again on the next start, unchanged. Without that file
 nothing is sent. A held or waiting container edit that has no container yet is
 removed with the row that would have created it; it cannot be sent without it.
 Every other row is left unchanged, so rows that were ordered behind a removed
-row, or that the bot can still send, are free to be sent. With a PostgreSQL queue,
-pass the same ``database`` settings the bot uses (``--config``).
+row, or that the bot can still send, are free to be sent. With a PostgreSQL
+queue, pass the same ``database`` settings the bot uses (``--config``).
 """
 import argparse
 import fcntl
@@ -375,10 +375,9 @@ def clear(
     caption. A listed row held after a timeout or a cut connection, with every
     media file still there, is sent again. Without the file nothing is sent.
     ``database`` is ETM's ``database`` setting; the rows are read from the
-    queue of that backend. Queue-owned media files of
-    removed rows, and of rows that now send only their caption, are deleted
-    only when no remaining row refers to them; external media files are never
-    deleted.
+    queue of that backend. Queue-owned media files of removed rows, and of rows
+    that now send only their caption, are deleted only when no remaining row
+    refers to them; external media files are never deleted.
     """
     directory = directory.resolve()
     ids = frozenset() if not_delivered is None else frozenset(int(line) for line in not_delivered.read_text().split())
