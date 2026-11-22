@@ -191,8 +191,8 @@ While the bot runs, only `/confirm_send` ends a hold (and startup, for the
 clears only `history_failed:RequiredSenderUnavailableError` on a history row
 that never started an attempt). The bot never removes a held row or its media by
 itself. A held row that can never be sent is cleared offline: it is removed, or,
-for a media send of a message with text whose file is gone, it becomes a text
-send of its caption:
+for a media send of a message with text whose file is gone, it is kept for a
+text send of its caption:
 
 ```sh
 python -m efb_telegram_master.clear_unsendable --data-dir /channel/data
@@ -214,8 +214,11 @@ when it runs. These rows are removed:
 | `needs_removed_row` | Held or waiting edit of a container that does not exist yet (a `member_update` without `container_id`, see [Ordering links](#ordering-links)): the removed row would have created it. Repeated for edits that wait on such an edit in turn. |
 
 A held send of one media file (`send_photo`, `send_video`, `send_document` and
-the like) whose file is gone and whose message has text is kept as a text send
-of its caption instead (`caption_sent_as_text`). A stored caption usually
+the like) whose file is gone and whose message has text is not removed. Which of
+these rows send their caption is chosen in one place, `_send_caption` in
+`clear_unsendable.py`; no row is chosen yet, so they stay held, unchanged, and
+are counted as `captioned_waiting_for_choice`. A chosen row becomes a text send
+of its caption (`caption_sent_as_text`). A stored caption usually
 starts with the sender's name and shows only a placeholder for a message without
 text, so whether the message has text is read from the row's MsgLog context; a
 row without one counts by its stored caption. The row keeps its id, chat, topic,
@@ -239,8 +242,9 @@ removed row, or of a row that now sends only its caption, is deleted when no
 remaining row names it; while any remaining row's media cannot be read, all
 files are kept. External media files are never deleted. The output has counts
 only: all rows, removed rows by reason and by operation, rows whose caption is
-sent as text, kept rows (including those), kept rows that were ordered behind a
-removed row (`released`), and deleted files. To undo `--apply`, restore the
+sent as text, captioned rows waiting for a choice, kept rows (including both),
+kept rows that were ordered behind a removed row (`released`), and deleted
+files. To undo `--apply`, restore the
 queue (`outbound-queue.sqlite3` and `outbound-media/`, or the PostgreSQL queue
 tables) from a backup taken before it.
 
@@ -266,7 +270,7 @@ below lists only events on an existing row.
 | remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
 | discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
-| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a send of a message with text whose file is gone (above) |
+| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a chosen send of a message with text whose file is gone (above) |
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is

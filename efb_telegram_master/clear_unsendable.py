@@ -5,9 +5,9 @@ A held row is removed when its stored request can no longer be sent: its
 external media file is gone, its queue-owned media file is gone, its request
 cannot be decoded, or Telegram rejected its aggregated batch (BadRequest).
 A held send whose media file is gone but whose message has text is not
-removed: it becomes a text send of its caption, to the same chat and topic,
-from the bot that attempted it, which the bot sends on its next start in the
-row's place. A held or waiting container edit that has no container yet is removed
+removed: it is left held until it is chosen to become a text send of its
+caption, to the same chat and topic, from the bot that attempted it, which the
+bot sends on its next start in the row's place. A held or waiting container edit that has no container yet is removed
 with the row that would have created it; it cannot be sent without it. Every
 other row is left unchanged, so rows that were ordered behind a removed row,
 or that the bot can still send, are free to be sent. With a PostgreSQL queue,
@@ -82,15 +82,24 @@ def _unsendable(state: RowState, hold: str, references, media_dir: Path) -> str 
     return None
 
 
+def _send_caption(row_id: int, hold: str) -> bool:
+    """Whether a held send whose file is gone sends its caption as text now.
+
+    The only place that chooses among those rows; none is chosen yet, so they
+    stay held and are counted as waiting for a choice.
+    """
+    return False
+
+
 def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) -> bytes | None:
     """The request that sends a gone media file's caption as text, or None to remove the row.
 
-    This is where the rows that get their caption sent are chosen: every send of
-    one media file, alone or between text batches, whose message has text. A
-    stored caption usually starts with the sender's name and shows a placeholder
-    when the message has no text, so a message without text is removed. A member
-    of a text batch is built again from its batch when sent, and a full-content
-    attachment's caption only announces the file: both are removed too.
+    A caption is kept for a send of one media file, alone or between text
+    batches, whose message has text. A stored caption usually starts with the
+    sender's name and shows a placeholder when the message has no text, so a
+    message without text is removed. A member of a text batch is built again
+    from its batch when sent, and a full-content attachment's caption only
+    announces the file: both are removed too.
     """
     if not operation.startswith("send_") or operation not in _DIRECT_MEDIA_ARGUMENTS:
         return None
@@ -133,7 +142,7 @@ def _references(run: Callable, row_id: int, version: bytes, size: int):
 
 
 def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict[int, tuple], dict, set[str]]:
-    """Decide which rows go and which send their caption as text instead.
+    """Decide which rows go, which send their caption as text instead and which wait.
 
     Returns (row id -> reason, row id -> new request and sender, report counts,
     sidecar names to delete).
@@ -147,6 +156,7 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict[int, tu
     uninspected: set[int] = set()
     removed: dict[int, str] = {}
     captions: dict[int, tuple[bytes, str]] = {}
+    waiting = 0  # Captions left held until chosen.
     for row_id, operation, state, hold, reconcile_after, predecessor, version, size, required, attempted in run(
         "SELECT id, operation, delivery_state, delivery_hold, reconcile_after, predecessor_id, "
         "substr(payload, 1, 1), length(payload), required_sender_bot_id, attempt_sender_bot_id "
@@ -168,9 +178,11 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict[int, tu
             if reason in _GONE_FILE and next_state(current, Event.REPLACE_REQUEST) is not None:
                 payload, log_context = run("SELECT payload, log_context FROM outbound_queue WHERE id=?", (row_id,))[0]
                 text = _caption_as_text(operation, bytes(payload), None if log_context is None else bytes(log_context))
-            if text is not None:
+            if text is not None and _send_caption(row_id, hold):
                 # The same bot sends the caption; a row ordered behind it waits for it.
                 captions[row_id] = (text, required or attempted or "__main__")
+            elif text is not None:
+                waiting += 1
             elif reason is not None:
                 removed[row_id] = reason
 
@@ -201,6 +213,7 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict[int, tu
         "removed": dict(Counter(removed.values())),
         "removed_by_operation": dict(Counter(operations[row_id] for row_id in removed)),
         "caption_sent_as_text": len(captions),
+        "captioned_waiting_for_choice": waiting,
         "kept": len(kept),
         # Kept rows that were ordered behind a removed row; nothing defers them now.
         "released": sum(1 for row_id in kept if predecessors.get(row_id) in removed),
@@ -269,8 +282,8 @@ def _clear_postgresql(directory: Path, config: Mapping, apply: bool) -> tuple[di
 def clear(directory: Path, *, apply: bool = False, database: Mapping | None = None) -> dict:
     """Report, and with ``apply`` remove, the rows that can never be sent.
 
-    A row whose media file is gone and whose message has text becomes a text
-    send of its caption instead of being removed. ``database`` is ETM's ``database`` setting; the
+    A row whose media file is gone and whose message has text is not removed:
+    it stays held, or, once chosen, becomes a text send of its caption. ``database`` is ETM's ``database`` setting; the
     rows are read from the queue of that backend. Queue-owned media files of
     removed rows, and of rows that now send only their caption, are deleted
     only when no remaining row refers to them; external media files are never
@@ -308,7 +321,7 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path, default=None,
                         help="YAML with the database mapping the bot uses; needed only for a PostgreSQL queue")
     parser.add_argument("--apply", action="store_true",
-                        help="Remove the rows and turn captions into text sends; without it only counts are printed")
+                        help="Remove the rows and turn chosen captions into text sends; without it only counts are printed")
     args = parser.parse_args(argv)
     errors: tuple = (OSError, ImportError, RuntimeError, ValueError, sqlite3.Error)
     try:
