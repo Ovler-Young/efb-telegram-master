@@ -12,7 +12,7 @@ from ehforwarderbot.chat import ChatMember, GroupChat, PrivateChat, SystemChat
 from ehforwarderbot.status import MessageRemoval
 from ehforwarderbot.message import LinkAttribute, MessageCommand, MessageCommands
 
-from efb_telegram_master.aggregate import make_aggregate, make_source_member, member_message, utf16_length
+from efb_telegram_master.aggregate import MemberStatus, make_aggregate, make_source_member, member_message, utf16_length
 from efb_telegram_master.db import MsgLog
 from efb_telegram_master.live_aggregate import LiveTextAggregation
 from efb_telegram_master.msg_type import TGMsgType
@@ -394,6 +394,115 @@ def test_redirect_confirmation_survives_hint_failure_and_newer_edit(runtime, mak
     assert not manager._outbound_queue.contains(submitted.row.id)
     complete(manager)
     assert member_message(manager.channel.db.resolve_source_member(key[0], "one", "-100")[1]).text == "editable after failed hint"
+
+
+NOT_MODIFIED = ("Bad Request: message is not modified: specified new message content and reply markup "
+                "are exactly the same as a current content and reply markup of the message")
+
+
+def standalone(manager, handler):
+    """Source "one" leaves its combined message for its own message 2."""
+    key, _ = append(manager, "one", 1)
+    append(manager, "two", 1.1, "other saved source")
+    complete(manager)
+    manager.channel.commands = SimpleNamespace(register_command=lambda receipt, context: None)
+    message = source("one", "body with action")
+    message.chat.members.append(message.author)
+    message.edit = True
+    message.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
+    handler.send_message(message)
+    with patch("ehforwarderbot.coordinator.get_module_by_id", return_value=SimpleNamespace(action=lambda: "x")):
+        complete(manager)
+        complete(manager)
+    assert manager.transport.messages[2].text.endswith("body with action")
+    return key
+
+
+def applied_then_not_modified(manager):
+    """Telegram applies the first edit but its answer is lost; the next try changes nothing."""
+    original = manager.transport.edit_message_text
+    tries = []
+
+    def edit_message_text(text, chat_id, message_id, parse_mode=None, **kwargs):
+        tries.append(message_id)
+        if len(tries) == 1:
+            original(text, chat_id, message_id, parse_mode, **kwargs)
+            raise NetworkError("response lost")
+        raise BadRequest(NOT_MODIFIED)
+
+    manager.transport.edit_message_text = edit_message_text
+    return tries
+
+
+def run(manager, passes=2):
+    scheduler = manager._outbound_scheduler
+    for _ in range(passes):
+        scheduler.dispatch_once()
+        for submitted in tuple(scheduler.in_flight.values()):
+            submitted.future.exception(timeout=2)
+        scheduler.harvest_completed()
+
+
+def test_new_messages_appended_by_an_unanswered_edit_stay_held(runtime):
+    """The edit is the only copy of the appended messages, so it is held like a send."""
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    append(manager, "one", 1, "first message")
+    complete(manager)
+    append(manager, "two", 5, "second message")
+    manager.transport.error = NetworkError("response lost")
+    run(manager)
+    queue = manager._outbound_queue
+    rows = queue.connection.execute("SELECT operation, delivery_hold, payload FROM outbound_queue").fetchall()
+    assert [(operation, hold) for operation, hold, _payload in rows] == [("edit_message_text", "uncertain:NetworkError")]
+    assert "second message" in queue.decode_payload_raw(bytes(rows[0][2]))[1]["text"]
+    assert [call[0] for call in manager.transport.calls] == ["send_message", "edit_message_text"]
+
+
+def test_an_applied_edit_whose_answer_was_lost_is_finished_by_its_next_try(runtime):
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    handler = processor(manager)
+    key = standalone(manager, handler)
+    edit(handler, "one", "edited text")
+    tries = applied_then_not_modified(manager)
+    run(manager)
+    assert tries == [2, 2]
+    assert not manager._outbound_queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+    assert member_message(manager.channel.db.resolve_source_member(key[0], "one", "-100")[1]).text == "edited text"
+
+
+def test_an_applied_removal_whose_answer_was_lost_sends_no_notice(runtime):
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    manager.channel._ = lambda text: text
+    handler = processor(manager)
+    key = standalone(manager, handler)
+    calls = len(manager.transport.calls)
+    remove(handler, "one")
+    tries = applied_then_not_modified(manager)
+    run(manager, passes=4)
+    assert tries == [2, 2]
+    assert [call[0] for call in manager.transport.calls[calls:]] == ["edit_message_text"]
+    assert not manager._outbound_queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+    assert manager.channel.db.resolve_source_member(key[0], "one", "-100")[1]["status"] == MemberStatus.REMOVED
+
+
+def test_an_unanswered_source_edit_is_dropped_for_a_newer_edit_of_its_message(runtime):
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    handler = processor(manager)
+    key = standalone(manager, handler)
+    calls = len(manager.transport.calls)
+    edit(handler, "one", "older edit")
+    edit(handler, "one", "newer edit")
+    manager.transport.error = NetworkError("response lost")
+    run(manager, passes=1)
+    manager.transport.error = None
+    run(manager)
+    assert [call[2].rsplit("\n", 1)[-1] for call in manager.transport.calls[calls:]] == ["older edit", "newer edit"]
+    assert not manager._outbound_queue.connection.execute("SELECT COUNT(*) FROM outbound_queue").fetchone()[0]
+    assert member_message(manager.channel.db.resolve_source_member(key[0], "one", "-100")[1]).text == "newer edit"
 
 
 def test_pending_qualification_split_preserves_source_order(runtime, make_queue):

@@ -9,7 +9,7 @@ from telegram import Chat, Message
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from efb_telegram_master.db_runtime import postgresql_connection
-from efb_telegram_master.outbound import QueueRequest, create_postgresql_queue_tables
+from efb_telegram_master.outbound import DeliveryUncertainError, QueueRequest, create_postgresql_queue_tables
 from efb_telegram_master.queued_log import encode_aggregation
 from tests.unit.test_delivery_uncertainty import (
     accepted_then_lost_response,
@@ -23,22 +23,26 @@ def edit_message_text(chat_id, message_id, text, **kwargs):
     return None
 
 
+def edit_message_caption(chat_id, message_id, caption=None, **kwargs):
+    return None
+
+
 def send_message(chat_id, text, **kwargs):
     return None
 
 
-OPERATIONS = {function.__name__: function for function in (edit_message_text, send_message)}
+OPERATIONS = {function.__name__: function for function in (edit_message_text, edit_message_caption, send_message)}
 
 
 def edited(text="edited"):
     return Message(100, datetime.now(timezone.utc), Chat(CHAT, "supergroup"), text=text)
 
 
-def _edit(queue, text, *, context=None):
+def _edit(queue, text, *, mode="eventual"):
     row_id, waiter = queue.enqueue_many([QueueRequest("edit_message_text", (), {
         "chat_id": CHAT, "message_id": 100, "text": text, "_slave_id": "slave",
-        "_required_sender_bot_id": "__main__",
-    }, context)], OPERATIONS.__getitem__)
+        "_required_sender_bot_id": "__main__", "_send_mode": mode,
+    })], OPERATIONS.__getitem__)
     return row_id, waiter
 
 
@@ -57,7 +61,8 @@ def _row(queue, row_id):
 
 def test_a_timed_out_edit_is_tried_once_more_then_dropped(tmp_path, make_queue):
     queue = make_queue(tmp_path)
-    row_id, waiter = _edit(queue, "new text")
+    # A caller waits for this edit; it is still not held.
+    row_id, waiter = _edit(queue, "new text", mode="blocking")
     manager = setup_manager(queue)
     manager.TRANSPORT_RETRY_SECONDS = 0
     attempts = []
@@ -154,14 +159,28 @@ def test_a_timed_out_edit_with_a_newer_edit_queued_is_dropped_without_a_retry(tm
     queue.close()
 
 
-def test_a_later_aggregated_container_update_does_not_drop_the_older_edit(tmp_path, make_queue):
-    """The container update is rendered from the confirmed container, without the older edit's text."""
+def test_an_applied_caption_edit_whose_answer_was_lost_stays_held(tmp_path, make_queue):
+    """Without Telegram's answer the message log cannot learn the media, so the row waits for the operator."""
     queue = make_queue(tmp_path)
-    old_id, _ = _edit(queue, "old text")
-    update = encode_aggregation({"format_version": 1, "kind": "member_update", "key": ("slave", CHAT, None),
-                                 "container_id": f"{CHAT}.100", "updates": [], "members": []})
-    _edit(queue, "", context=update)
-    assert queue.unconfirmed_edit_superseded(old_id) is None
+    row_id, waiter = queue.enqueue_many([QueueRequest("edit_message_caption", (), {
+        "chat_id": CHAT, "message_id": 100, "caption": "new caption", "_slave_id": "slave",
+        "_required_sender_bot_id": "__main__",
+    })], OPERATIONS.__getitem__)
+    manager = setup_manager(queue)
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    attempts = []
+    lost = accepted_then_lost_response(attempts)
+
+    def not_modified(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise BadRequest("Bad Request: message is not modified")
+
+    replies = iter([lost, not_modified])
+    manager._bot = SimpleNamespace(edit_message_caption=lambda *args, **kwargs: next(replies)(*args, **kwargs))
+    _run(manager)
+    assert len(attempts) == 2
+    assert _row(queue, row_id)[:2] == ("uncertain:InvalidTelegramResponseError/BadRequest", "Message is not modified")
+    assert isinstance(waiter.exception(timeout=1), DeliveryUncertainError)
     queue.close()
 
 

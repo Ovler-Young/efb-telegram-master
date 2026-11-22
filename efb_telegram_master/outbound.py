@@ -3068,7 +3068,7 @@ class OutboundQueue:
                    telegram_error_text(error))
 
     @classmethod
-    def _edited_message_id(cls, operation: str, payload) -> int | None:
+    def edited_message_id(cls, operation: str, payload) -> int | None:
         try:
             args, kwargs = cls.decode_payload_raw(bytes(payload))
         except InvalidQueuedPayloadError:
@@ -3080,15 +3080,24 @@ class OutboundQueue:
             message_id = args[index]
         return message_id if isinstance(message_id, int) else None
 
+    def edit_unconfirmed(self, row_id: int) -> bool:
+        """Whether Telegram did not confirm an earlier try of this edit."""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT unconfirmed_at FROM outbound_queue WHERE id=?", (row_id,)
+            ).fetchone()
+        return row is not None and row[0] is not None
+
     def unconfirmed_edit_superseded(self, row_id: int) -> str | None:
         """Why an edit whose result is unknown is dropped instead of tried again, or None.
 
         It is dropped when Telegram did not confirm an earlier try of it either,
         or when a later row edits the same message with its complete text:
-        replaying the old edit after that would put old text over new. A later aggregated container
-        update is not such an edit; it is rendered from the confirmed container
-        and would not carry this edit's content.
+        replaying the old edit after that would put old text over new. A later
+        combined-message update is not such an edit; it is rendered from the
+        confirmed combined message and would not carry this edit's content.
         """
+        from .queued_log import decode_aggregation
         with self._lock:
             row = self.connection.execute(
                 "SELECT telegram_chat_id, operation, payload, unconfirmed_at FROM outbound_queue WHERE id=?",
@@ -3098,17 +3107,20 @@ class OutboundQueue:
                 return None
             if row[3] is not None:
                 return "Telegram did not confirm its earlier try either"
-            message_id = self._edited_message_id(row[1], row[2])
+            message_id = self.edited_message_id(row[1], row[2])
             if message_id is None:
                 return None
             later = self.connection.execute(
-                "SELECT operation, payload FROM outbound_queue WHERE telegram_chat_id=? AND id>? "
-                "AND operation IN (?, ?) AND (log_context IS NULL OR substr(log_context, 1, 1)<>?) "
-                "AND length(payload)<=? ORDER BY id",
-                (row[0], row_id, *sorted(EDIT_OPERATIONS), b"\x03", self.MAX_INSPECT_BYTES),
+                "SELECT operation, payload, log_context FROM outbound_queue WHERE telegram_chat_id=? AND id>? "
+                "AND operation IN (?, ?) AND length(payload)<=? ORDER BY id",
+                (row[0], row_id, *sorted(EDIT_OPERATIONS), self.MAX_INSPECT_BYTES),
             ).fetchall()
-        if any(self._edited_message_id(operation, payload) == message_id for operation, payload in later):
-            return "a newer edit of the same message is queued"
+        for operation, payload, context in later:
+            if self.edited_message_id(operation, payload) != message_id:
+                continue
+            kind = (decode_aggregation(bytes(context)) or {}).get("kind") if context else None
+            if kind not in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE, ContextKind.AGGREGATE}:
+                return "a newer edit of the same message is queued"
         return None
 
     def hold_invalid_payload(self, row_id: int) -> None:

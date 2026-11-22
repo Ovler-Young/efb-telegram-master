@@ -1747,6 +1747,23 @@ class TelegramBotManager(LocaleMixin):
                                        chat=telegram.Chat(key[1], "supergroup"),
                                        text=context["aggregate"]["confirmed_text"],
                                        message_thread_id=int(key[2]) if key[2] is not None else None)
+            if (row.operation in EDIT_OPERATIONS and "message is not modified" in str(error).lower()
+                    and self._outbound_queue.edit_unconfirmed(row.id)):
+                # Telegram applied the earlier try of this edit and only its answer was lost.
+                if row.operation == "edit_message_caption":
+                    # Its message log needs the media from Telegram's answer, so
+                    # the row stays held for the operator.
+                    raise InvalidTelegramResponseError(
+                        "Telegram applied an earlier try of this caption edit; its answer was lost."
+                    ) from error
+                from datetime import datetime, timezone
+                text, _ = self._queued_content_argument(telegram_args, telegram_kwargs, "text", 0)
+                return TelegramMessage(
+                    message_id=OutboundQueue.edited_message_id(row.operation, row.payload),
+                    date=datetime.now(timezone.utc),
+                    chat=telegram.Chat(self._queued_chat_id_argument(row.operation, telegram_args, telegram_kwargs),
+                                       "supergroup"),
+                    text=text, message_thread_id=row.thread_id)
             replay = kwargs.get(HISTORY_REPLAY_KEY)
             # Only an explicit negative acknowledgment permits a second send.
             # A missing response or timeout must keep using delivery uncertainty.
@@ -1999,7 +2016,11 @@ class TelegramBotManager(LocaleMixin):
             and not isinstance(error, telegram.error.BadRequest)
             and not transport_definitely_not_sent(error)
         )
-        if operation in EDIT_OPERATIONS and ambiguous_network:
+        from .queued_log import decode_aggregation
+        context = decode_aggregation(row.log_context) if operation in EDIT_OPERATIONS and row.log_context else None
+        # An edit that appends new messages to a combined message is their only
+        # copy: it is held like a send.
+        if operation in EDIT_OPERATIONS and ambiguous_network and not (context and context.get("members")):
             # Repeating an edit over the same text is harmless; holding it would
             # leave an old edit that can never be replayed safely over newer text.
             return QueuedCompletionDecision(
