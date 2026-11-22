@@ -209,7 +209,7 @@ when it runs and removes:
 | `missing_sidecar` | Held; a queue-owned file it names in `outbound-media/` is gone. |
 | `invalid_payload` | Held as `invalid_payload`. |
 | `rejected_batch` | Held as `aggregation_failed:BadRequest`: Telegram rejected the batch. |
-| `needs_removed_row` | Held or waiting, and needs the Telegram message of a removed row (`needs_delivered_predecessor`, see [Ordering links](#ordering-links)); repeated for the rows that need it in turn. |
+| `needs_removed_row` | Held or waiting edit of a container that does not exist yet (a `member_update` without `container_id`, see [Ordering links](#ordering-links)): the removed row would have created it. Repeated for edits that wait on such an edit in turn. |
 
 It never removes an `in_flight` or `sent_pending` row or an unrecognized hold,
 and it does not look for the message in the chat: if a removed row had in fact

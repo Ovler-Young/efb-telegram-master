@@ -4,9 +4,10 @@ Run only while EFB is stopped. Without --apply, this only reports counts.
 A held row is removed when its stored request can no longer be sent: its
 external media file is gone, its queue-owned media file is gone, its request
 cannot be decoded, or Telegram rejected its aggregated batch (BadRequest).
-Held or waiting rows that need the Telegram message of a removed row are
-removed with it. Every other row is left unchanged, so rows that were only
-ordered behind a removed row are free to be sent. With a PostgreSQL queue,
+A held or waiting container edit that has no container yet is removed with
+the row that would have created it; it cannot be sent without it. Every other
+row is left unchanged, so rows that were ordered behind a removed row, or that
+the bot can still send, are free to be sent. With a PostgreSQL queue,
 pass the same ``database`` settings the bot uses (``--config``).
 """
 import argparse
@@ -20,7 +21,7 @@ from contextlib import ExitStack, closing
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .aggregation_states import needs_delivered_predecessor
+from .aggregation_states import ContextKind
 from .db_runtime import DataDirectoryLock, postgresql_connection
 from .delivery_states import Event, RowState, classify, next_state, parse_hold
 from .outbound import _POSTGRESQL_OWNER_LOCK, POSTGRESQL_QUEUE_MARKER, OutboundQueue
@@ -31,7 +32,7 @@ MISSING_MEDIA = "missing_media"            # external media file gone
 MISSING_SIDECAR = "missing_sidecar"        # queue-owned media file gone
 INVALID_PAYLOAD = "invalid_payload"        # stored request cannot be decoded
 REJECTED_BATCH = "rejected_batch"          # aggregated batch rejected with BadRequest
-NEEDS_REMOVED_ROW = "needs_removed_row"    # needs the Telegram message of a removed row
+NEEDS_REMOVED_ROW = "needs_removed_row"    # edit of a container its removed predecessor would have created
 
 _WAITING = (RowState.WAITING, RowState.DEFERRED)
 
@@ -122,7 +123,7 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[st
             if row_id in removed or (state not in _WAITING and next_state(state, Event.DISCARD) is None):
                 continue
             own = context(row_id)
-            if own is not None and needs_delivered_predecessor(own, context(predecessor)):
+            if own is not None and own.get("kind") == ContextKind.MEMBER_UPDATE and not own.get("container_id"):
                 removed[row_id] = NEEDS_REMOVED_ROW
                 pending.append(row_id)
 

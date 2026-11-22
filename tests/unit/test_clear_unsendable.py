@@ -84,43 +84,50 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
     queue = make_queue(data)
     member = {"origin_uid": "origin", "source_id": "1"}
 
-    gone_media = _add(queue, "send_document", {"chat_id": -1001, "document": gone.as_uri()}, cleanup=(str(gone),))
+    gone_media = _add(queue, "send_document",
+                      {"chat_id": -1001, "document": gone.as_uri(), "thumbnail": b"thumbnail"}, cleanup=(str(gone),))
     rejected = _add(queue, "send_message", {"chat_id": -1001, "text": "batch"},
                     context=_context("aggregate", members=[member]))
+    # An edit whose container the removed batch would have created cannot be sent without it.
     update = _add(queue, "edit_message_text",
                   {"chat_id": -1001, "message_id": 5, "text": "batch", "_required_sender_bot_id": "901"},
                   context=_context("member_update", updates=[member]), predecessor=rejected)
-    append = _add(queue, "send_document", {"chat_id": -1001, "document": b"own file"},
+    # Rows the bot still sends without the removed rows: an append into a new container, an edit of
+    # a container already on Telegram and a second output of a member.
+    append = _add(queue, "send_message", {"chat_id": -1001, "text": "next"},
                   context=_context("logical", members=[member], inherit=True), predecessor=update)
+    edit = _add(queue, "edit_message_text",
+                {"chat_id": -1001, "message_id": 6, "text": "edited", "_required_sender_bot_id": "901"},
+                context=_context("member_update", updates=[member], container_id="slave.6"), predecessor=rejected)
     source = _add(queue, "send_document", {"chat_id": -1001, "document": b"shared file"},
                   context=_context("source", member=member), predecessor=rejected)
     behind = _add(queue, "send_message", {"chat_id": -1002, "text": "ordered after"}, predecessor=gone_media)
     kept_media = _add(queue, "send_document", {"chat_id": -1001, "document": present.as_uri()},
                       cleanup=(str(present),))
     kept_text = _add(queue, "send_message", {"chat_id": -1001, "text": "text"})
-    shares_file = _add(queue, "send_document", {"chat_id": -1003, "document": b"replaced"})
     for row_id, error in ((gone_media, TimedOut()), (rejected, BadRequest("Message is too long")),
-                          (update, TimedOut()), (source, TimedOut()), (kept_media, TimedOut())):
+                          (update, TimedOut()), (edit, TimedOut()), (source, TimedOut()),
+                          (kept_media, TimedOut())):
         _hold(queue, row_id, error)
-    _copy_payload(queue, source, shares_file)
+    _copy_payload(queue, source, rejected)  # A removed row and a kept row name one file.
     gone.unlink()
     queue.close()
     before = _rows(data, queue_backend)
     files = set(queue.media_dir.iterdir())
 
-    expected = {"missing_media": 1, "rejected_batch": 1, "needs_removed_row": 3}
+    expected = {"missing_media": 1, "rejected_batch": 1, "needs_removed_row": 1}
     report = clear(data, database=queue_backend)
-    assert report["removed"] == expected and report["released"] == 1 and report["media_files_removed"] == 1
+    assert report["removed"] == expected and report["released"] == 4 and report["media_files_removed"] == 1
     assert not report["applied"]
     assert _rows(data, queue_backend) == before and set(queue.media_dir.iterdir()) == files
 
     report = clear(data, apply=True, database=queue_backend)
-    assert report["removed"] == expected and report["kept"] == 4 and report["media_files_removed"] == 1
+    assert report["removed"] == expected and report["kept"] == 6 and report["media_files_removed"] == 1
     # Only the removed row's own file went; the file a kept row still names stays.
     assert len(files - set(queue.media_dir.iterdir())) == 1 and present.exists()
-    removed = {gone_media, rejected, update, append, source}
+    removed = {gone_media, rejected, update}
     assert _rows(data, queue_backend) == {row_id: row for row_id, row in before.items() if row_id not in removed}
-    assert set(_rows(data, queue_backend, ready_sql("q"))) == {behind, kept_text, shares_file}
+    assert set(_rows(data, queue_backend, ready_sql("q"))) == {append, behind, kept_text}
 
 
 @pytest.mark.parametrize("spelling", sorted(set(ROW_SPELLINGS) - {"absent"}))
