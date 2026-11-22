@@ -221,12 +221,14 @@ tool itself does not look in the chat. Only listed rows are sent, in two ways:
 
 * **Caption as text.** A held send of one media file (`send_photo`,
   `send_video`, `send_document` and the like) whose file is gone and whose
-  caption has text beyond the sender's header becomes a text send of its
-  caption (`caption_sent_as_text`). A stored caption starts with the sender's
-  header line, which ends in `:`; for a message without text the header is
-  followed by a placeholder line or by nothing. A caption that is only that
-  header (one short line ending in `:`, ignoring formatting) is not sent: the
-  row is removed and counted as `caption_header_only`.
+  caption has text from the sender becomes a text send of its caption
+  (`caption_sent_as_text`). A stored caption starts with the sender's header
+  line, which ends in `:`; for a message without text the header is followed
+  by nothing or by the bot's own placeholder for the media (the
+  `default_media_prompt` emoji or text, in any of the bot's languages). Such a
+  caption, the header (one short line ending in `:`, ignoring formatting) with
+  only that placeholder or nothing after it, is not sent: the row is removed
+  and counted as `caption_header_only`.
 * **Sent again.** A send held as uncertain after a timeout or a cut connection
   (`uncertain:TimedOut...` or `uncertain:NetworkError...`) whose media files
   are all still there is released unchanged (`resend`): its hold, attempt and
@@ -239,7 +241,9 @@ counted as `caption_not_sent`. Every other held row stays held. Without
 `--not-delivered`, nothing is sent, every row whose file is gone is removed, and
 the output says so. Ids in the file that do not name such a row change nothing.
 A member of a text batch (an aggregation context other than `boundary`) is
-neither converted nor released: it is built again from its batch when sent.
+neither converted nor released: it is built again from its batch when sent. A
+listed member that would otherwise be sent again stays held and is counted as
+`resend_batch_member`.
 A full-content attachment's caption only announces the file, so that row is
 removed.
 
@@ -262,9 +266,9 @@ row, or of a row that now sends only its caption, is deleted when no remaining
 row names it; while any remaining row's media cannot be read, all files are
 kept. External media files are never deleted. The output has counts only: all
 rows, removed rows by reason and by operation, `caption_sent_as_text`,
-`caption_header_only`, `caption_not_sent`, `resend`, kept rows (including those
-sending a caption or sent again), kept rows that were ordered behind a removed
-row (`released`), and deleted files. To undo `--apply`, restore the queue
+`caption_header_only`, `caption_not_sent`, `resend`, `resend_batch_member`,
+kept rows (including those sending a caption or sent again), kept rows that
+were ordered behind a removed row (`released`), and deleted files. To undo `--apply`, restore the queue
 (`outbound-queue.sqlite3` and `outbound-media/`, or the PostgreSQL queue tables)
 from a backup taken before it.
 
@@ -290,7 +294,7 @@ below lists only events on an existing row.
 | remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
 | discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
-| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send whose file is gone and whose caption has text beyond the header (above) |
+| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send whose file is gone and whose caption has text from the sender (above) |
 | resend | uncertain | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send held after a timeout or a cut connection whose files are all there (above) |
 
 An event the row's state does not accept is never applied. The queue raises

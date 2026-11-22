@@ -122,7 +122,8 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
                      context=_context("boundary", legacy_context=log))
     unlisted = _add(queue, "send_video", {**caption, "video": unlisted_file.as_uri()}, cleanup=(str(unlisted_file),),
                     context=log)
-    # A message without text has the sender's header as caption, with or without a placeholder line.
+    # A message without text has the sender's header as caption, with or without the bot's placeholder line:
+    # neither is sent.
     untexted = message_with_group()
     untexted.text = ""
     placeholder = _add(queue, "send_video", {"chat_id": -1004, "video": untexted_file.as_uri(),
@@ -162,17 +163,18 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
     assert report["media_files_removed"] == 2 and not report["applied"]
     assert _rows(data, queue_backend) == before and set(queue.media_dir.iterdir()) == files
 
-    # A listed caption is sent unless it is only the sender's header; a listed rejected batch is still removed.
+    # A listed caption is sent only when it has the sender's text; a listed rejected batch is still removed;
+    # a listed timed-out member of a text batch stays held.
     listed = tmp_path / "not-delivered.txt"
-    listed.write_text(f"{captioned}\n{placeholder}\n{header}\n{resend}\n{rejected}\n")
+    listed.write_text(f"{captioned}\n{placeholder}\n{header}\n{resend}\n{rejected}\n{source}\n")
     report = clear(data, apply=True, database=queue_backend, not_delivered=listed)
-    assert report["removed"] == {"missing_media": 3, "rejected_batch": 1, "needs_removed_row": 1}
-    assert report["caption_sent_as_text"] == 2 and report["caption_not_sent"] == 1
-    assert report["caption_header_only"] == 1 and report["resend"] == 1
-    assert report["kept"] == 11 and report["released"] == 4 and report["media_files_removed"] == 2
+    assert report["removed"] == {"missing_media": 4, "rejected_batch": 1, "needs_removed_row": 1}
+    assert report["caption_sent_as_text"] == 1 and report["caption_not_sent"] == 1
+    assert report["caption_header_only"] == 2 and report["resend"] == 1 and report["resend_batch_member"] == 1
+    assert report["kept"] == 10 and report["released"] == 4 and report["media_files_removed"] == 2
     # Only the files of the removed row and of the converted row went; the file a kept row still names stays.
     assert len(files - set(queue.media_dir.iterdir())) == 2 and present.exists()
-    removed, converted = {gone_media, rejected, update, unlisted, header}, {captioned, placeholder}
+    removed, converted = {gone_media, rejected, update, unlisted, placeholder, header}, {captioned}
     rows = _rows(data, queue_backend)
     assert all(rows.pop(row_id) != before[row_id] for row_id in converted | {resend})
     assert rows == {row_id: row for row_id, row in before.items() if row_id not in removed | converted | {resend}}
@@ -180,8 +182,6 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
     assert _rows(data, queue_backend, columns=stored)[resend] == before_resend
     ready = set(_rows(data, queue_backend, ready_sql("q")))
     assert ready == {append, behind, kept_text, resend, *converted}
-    sent = _rows(data, queue_backend, f"id = {placeholder}", "operation, payload")[placeholder]
-    assert (sent[0], pickle.loads(sent[1][1:])[1]["text"]) == ("send_message", "<b>Author:</b>\n🖼️")
     # The same chat, topic, text and formatting, without the video, from the bot that attempted it, in its place.
     assert _rows(data, queue_backend, columns=unchanged)[captioned] == before_unchanged
     operation, payload, sender = _rows(data, queue_backend, columns="operation, payload, required_sender_bot_id")[

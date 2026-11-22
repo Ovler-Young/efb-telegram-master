@@ -5,9 +5,10 @@ A held row is removed when its stored request can no longer be sent: its
 external media file is gone, its queue-owned media file is gone, its request
 cannot be decoded, or Telegram rejected its aggregated batch (BadRequest).
 The --not-delivered file lists row ids found not delivered, one per line. A
-listed held send whose media file is gone and whose caption has text beyond the
-sender's header is not removed: it becomes a text send of its caption, to the
-same chat and topic, from the bot that attempted it, which the bot sends on its
+listed held send whose media file is gone and whose caption has text from the
+sender, beyond the header and the bot's media placeholder, is not removed: it
+becomes a text send of its caption, to the same chat and topic, from the bot
+that attempted it, which the bot sends on its
 next start in the row's place. A listed send held after a timeout or a cut
 connection whose media files are all still there is sent again on the next
 start, unchanged. Without that file nothing is sent. A held or
@@ -19,6 +20,7 @@ pass the same ``database`` settings the bot uses (``--config``).
 """
 import argparse
 import fcntl
+import functools
 import html
 import inspect
 import pickle
@@ -28,6 +30,7 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, closing
+from gettext import NullTranslations, translation
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -43,7 +46,9 @@ from .outbound import (
     SUPPLEMENTAL_KEY,
     OutboundQueue,
 )
+from .paths import LOCALE_DIR
 from .queued_log import decode_aggregation
+from .utils import MEDIA_PROMPT_EMOJI, media_prompt
 
 # Why a row is removed; only these names and their counts are reported.
 MISSING_MEDIA = "missing_media"            # external media file gone
@@ -109,7 +114,7 @@ def _alone(log_context: bytes | None) -> bool:
 
 def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) -> tuple[bytes, bool] | None:
     """The request that sends a gone media file's caption as text and whether
-    that caption is only the sender's header; None to remove the row.
+    that caption has no text from the sender; None to remove the row.
 
     A caption is kept for a send of one media file, alone or between text
     batches. A full-content attachment's caption only announces the file: it
@@ -154,17 +159,28 @@ def _references(run: Callable, row_id: int, version: bytes, size: int):
 _HTML_TAG = re.compile(r"<[^>]*>")
 
 
-def _header_only(caption: str, parse_mode: object) -> bool:
-    """Whether a caption is only the sender's header: one short line ending in ':'.
+@functools.cache
+def _media_prompts() -> frozenset[str]:
+    """Every line the bot writes for a media file sent without text, in any of its languages."""
+    translators = [NullTranslations(), *(
+        translation("efb_telegram_master", LOCALE_DIR, languages=[path.name], fallback=True)
+        for path in LOCALE_DIR.iterdir() if path.is_dir())]
+    return frozenset(media_prompt(kind, setting, translator.gettext)
+                     for kind in MEDIA_PROMPT_EMOJI for setting in ("emoji", "text") for translator in translators)
 
-    Such a caption is not sent. A message without text is stored with the
-    header alone or the header and a placeholder line; only the first is
-    header-only.
+
+def _header_only(caption: str, parse_mode: object) -> bool:
+    """Whether a caption has no text from the sender: one short header line
+    ending in ':', followed by nothing or only the bot's media placeholder.
+
+    Such a caption is not sent.
     """
     if str(parse_mode).lower() == "html":
         caption = html.unescape(_HTML_TAG.sub("", caption))
-    caption = caption.strip()
-    return "\n" not in caption and caption.endswith(":") and len(caption) <= 80
+    header, *rest = caption.strip().split("\n")
+    header = header.rstrip()
+    return (header.endswith(":") and len(header) <= 80
+            and all(not line.strip() or line.strip() in _media_prompts() for line in rest))
 
 
 def _clear(
@@ -173,8 +189,8 @@ def _clear(
     """Decide which rows go, which send their caption as text instead and
     which are sent again.
 
-    Only a row in ``not_delivered`` sends its caption, unless that caption is
-    only the sender's header, or is sent again. Returns (row id -> reason, row
+    Only a row in ``not_delivered`` sends its caption, unless that caption has
+    no text from the sender, or is sent again. Returns (row id -> reason, row
     id -> new request and sender, row ids sent again, report counts, sidecar
     names to delete).
     """
@@ -189,7 +205,8 @@ def _clear(
     captions: dict[int, tuple[bytes, str]] = {}
     resent: set[int] = set()
     unsent = 0  # Captions of removed rows that are not listed.
-    header_only = 0  # Listed rows removed because their caption is only the sender's header.
+    header_only = 0  # Listed rows removed because their caption has no text from the sender.
+    batch_members = 0  # Listed rows held after a timeout that are left held: they belong to a text batch.
     for row_id, operation, state, hold, reconcile_after, predecessor, version, size, required, attempted in run(
         "SELECT id, operation, delivery_state, delivery_hold, reconcile_after, predecessor_id, "
         "substr(payload, 1, 1), length(payload), required_sender_bot_id, attempt_sender_bot_id "
@@ -212,9 +229,11 @@ def _clear(
         if reason is None:
             # A listed send that may never have reached Telegram goes again, unchanged, if its files are all there.
             if (listed and references and next_state(current, Event.RESEND) is not None
-                    and parse_hold(hold)[1].split("/", 1)[0] in _TRANSIENT
-                    and _alone(_log_context(run, row_id))):
-                resent.add(row_id)
+                    and parse_hold(hold)[1].split("/", 1)[0] in _TRANSIENT):
+                if _alone(_log_context(run, row_id)):
+                    resent.add(row_id)
+                else:
+                    batch_members += 1
             continue
         caption = None
         if reason in _GONE_FILE and next_state(current, Event.REPLACE_REQUEST) is not None:
@@ -258,10 +277,12 @@ def _clear(
         "caption_sent_as_text": len(captions),
         # Removed rows with a caption that are not listed as not delivered.
         "caption_not_sent": unsent,
-        # Listed rows removed without sending because their caption is only the sender's header.
+        # Listed rows removed without sending because their caption has no text from the sender.
         "caption_header_only": header_only,
         # Listed rows held after a timeout or a cut connection, with every file still there: sent again.
         "resend": len(resent),
+        # Listed rows that would be sent again but belong to a text batch: left held.
+        "resend_batch_member": batch_members,
         "kept": len(kept),
         # Kept rows that were ordered behind a removed row; nothing defers them now.
         "released": sum(1 for row_id in kept if predecessors.get(row_id) in removed),
@@ -338,8 +359,8 @@ def clear(
     """Report, and with ``apply`` remove, the rows that can never be sent.
 
     ``not_delivered`` is a file of row ids, one per line, found not delivered.
-    A row whose media file is gone, whose caption has text beyond the sender's
-    header and whose id is in it is not removed: it becomes a text send of its
+    A row whose media file is gone, whose caption has text from the sender
+    and whose id is in it is not removed: it becomes a text send of its
     caption. A listed row held after a timeout or a cut connection, with every
     media file still there, is sent again. Without the file nothing is sent. ``database`` is ETM's ``database`` setting; the rows
     are read from the queue of that backend. Queue-owned media files of
