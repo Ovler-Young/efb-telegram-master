@@ -8,14 +8,13 @@ The --not-delivered file lists row ids found not delivered, one per line. A
 listed held send whose media file is gone and whose caption has text from the
 sender, beyond the header and the bot's media placeholder, is not removed: it
 becomes a text send of its caption, to the same chat and topic, from the bot
-that attempted it, which the bot sends on its
-next start in the row's place. A listed send held after a timeout or a cut
-connection whose media files are all still there is sent again on the next
-start, unchanged. Without that file nothing is sent. A held or
-waiting container edit that has no container yet is removed with the row that
-would have created it; it cannot be sent without it. Every
-other row is left unchanged, so rows that were ordered behind a removed row,
-or that the bot can still send, are free to be sent. With a PostgreSQL queue,
+that attempted it, which the bot sends on its next start in the row's place.
+A listed send held after a timeout or a cut connection whose media files are
+all still there is sent again on the next start, unchanged. Without that file
+nothing is sent. A held or waiting container edit that has no container yet is
+removed with the row that would have created it; it cannot be sent without it.
+Every other row is left unchanged, so rows that were ordered behind a removed
+row, or that the bot can still send, are free to be sent. With a PostgreSQL queue,
 pass the same ``database`` settings the bot uses (``--config``).
 """
 import argparse
@@ -125,8 +124,9 @@ def _caption_as_text(operation: str, payload: bytes, log_context: bytes | None) 
     args, kwargs = pickle.loads(payload[1:])
     if not isinstance(kwargs.get("caption"), str) or not kwargs["caption"].strip() or kwargs.get(SUPPLEMENTAL_KEY):
         return None
-    media_parameters = inspect.signature(getattr(Bot, operation)).parameters
-    bound = inspect.signature(getattr(Bot, operation)).bind_partial(None, *args).arguments
+    signature = inspect.signature(getattr(Bot, operation))
+    media_parameters = signature.parameters
+    bound = signature.bind_partial(None, *args).arguments
     request = {}
     for key, value in {**bound, **kwargs}.items():
         name = _AS_TEXT.get(key, key)
@@ -170,17 +170,19 @@ def _media_prompts() -> frozenset[str]:
 
 
 def _header_only(caption: str, parse_mode: object) -> bool:
-    """Whether a caption has no text from the sender: one short header line
-    ending in ':', followed by nothing or only the bot's media placeholder.
+    """Whether a caption has no text from the sender: the bot's sender header,
+    a line ending in ':' that the bot always ends with a newline, followed by
+    nothing or only the bot's media placeholder.
 
-    Such a caption is not sent.
+    Such a caption is not sent. A caption with no newline has no header (the
+    bot writes none in a chat linked to a single Telegram chat), so it is the
+    sender's own text.
     """
     if str(parse_mode).lower() == "html":
         caption = html.unescape(_HTML_TAG.sub("", caption))
-    header, *rest = caption.strip().split("\n")
-    header = header.rstrip()
-    return (header.endswith(":") and len(header) <= 80
-            and all(not line.strip() or line.strip() in _media_prompts() for line in rest))
+    header, newline, rest = caption.partition("\n")
+    return (bool(newline) and header.rstrip().endswith(":")
+            and all(not line.strip() or line.strip() in _media_prompts() for line in rest.split("\n")))
 
 
 def _clear(
@@ -228,8 +230,9 @@ def _clear(
         listed = row_id in not_delivered
         if reason is None:
             # A listed send that may never have reached Telegram goes again, unchanged, if its files are all there.
+            parsed = parse_hold(hold)
             if (listed and references and next_state(current, Event.RESEND) is not None
-                    and parse_hold(hold)[1].split("/", 1)[0] in _TRANSIENT):
+                    and parsed is not None and parsed[1].split("/", 1)[0] in _TRANSIENT):
                 if _alone(_log_context(run, row_id)):
                     resent.add(row_id)
                 else:
@@ -362,8 +365,9 @@ def clear(
     A row whose media file is gone, whose caption has text from the sender
     and whose id is in it is not removed: it becomes a text send of its
     caption. A listed row held after a timeout or a cut connection, with every
-    media file still there, is sent again. Without the file nothing is sent. ``database`` is ETM's ``database`` setting; the rows
-    are read from the queue of that backend. Queue-owned media files of
+    media file still there, is sent again. Without the file nothing is sent.
+    ``database`` is ETM's ``database`` setting; the rows are read from the
+    queue of that backend. Queue-owned media files of
     removed rows, and of rows that now send only their caption, are deleted
     only when no remaining row refers to them; external media files are never
     deleted.

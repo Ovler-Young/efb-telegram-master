@@ -222,13 +222,15 @@ tool itself does not look in the chat. Only listed rows are sent, in two ways:
 * **Caption as text.** A held send of one media file (`send_photo`,
   `send_video`, `send_document` and the like) whose file is gone and whose
   caption has text from the sender becomes a text send of its caption
-  (`caption_sent_as_text`). A stored caption starts with the sender's header
-  line, which ends in `:`; for a message without text the header is followed
-  by nothing or by the bot's own placeholder for the media (the
-  `default_media_prompt` emoji or text, in any of the bot's languages). Such a
-  caption, the header (one short line ending in `:`, ignoring formatting) with
-  only that placeholder or nothing after it, is not sent: the row is removed
-  and counted as `caption_header_only`.
+  (`caption_sent_as_text`). When the chat shows a sender header, a stored
+  caption starts with it: a line ending in `:` followed by a newline. For a
+  message without text the header is followed by nothing or by the bot's own
+  placeholder for the media (the `default_media_prompt` emoji or text, in any
+  of the bot's languages). Such a caption, the header (ignoring formatting)
+  with only that placeholder or nothing after it, is not sent: the row is
+  removed and counted as `caption_header_only`. A caption without a header
+  line, such as a one-line text of the sender that ends in `:`, is the
+  sender's text and is sent.
 * **Sent again.** A send held as uncertain after a timeout or a cut connection
   (`uncertain:TimedOut...` or `uncertain:NetworkError...`) whose media files
   are all still there is released unchanged (`resend`): its hold, attempt and
@@ -244,6 +246,8 @@ A member of a text batch (an aggregation context other than `boundary`) is
 neither converted nor released: it is built again from its batch when sent. A
 listed member that would otherwise be sent again stays held and is counted as
 `resend_batch_member`.
+Take the list after the bot's last stop and do not reuse it once the bot has run: a
+send released once that timed out again would be released again by the same list.
 A full-content attachment's caption only announces the file, so that row is
 removed.
 

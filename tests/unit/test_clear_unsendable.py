@@ -6,7 +6,7 @@ from contextlib import closing
 import pytest
 from telegram.error import BadRequest, TimedOut
 
-from efb_telegram_master.clear_unsendable import clear
+from efb_telegram_master.clear_unsendable import _header_only, clear
 from efb_telegram_master.db_runtime import postgresql_connection
 from efb_telegram_master.delivery_states import Event, RowState, next_state, ready_sql
 from efb_telegram_master.outbound import (
@@ -189,6 +189,23 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
     assert operation == "send_message" and sender == "901"
     text = {key: value for key, value in caption.items() if key != "caption"}
     assert pickle.loads(payload[1:]) == ((), {**text, "text": caption["caption"]})
+
+
+@pytest.mark.parametrize(("caption", "parse_mode", "header_only"), [
+    ("<b>Author:</b>\n", "HTML", True),
+    ("<b>Author:</b>\n🖼️", "HTML", True),
+    ("Author:\n", None, True),
+    # A header longer than one short line is still the header.
+    (f"{'Long name ' * 12}:\n🖼️", None, True),
+    ("<b>Author:</b>\nmessage", "HTML", False),
+    # A chat that shows no header: the caption is the sender's own text, even if it ends in ':'.
+    ("Here is the receipt:", "HTML", False),
+    ("Here is the receipt:", None, False),
+    ("<b>Author</b>\n🖼️", "HTML", False),
+])
+def test_a_caption_is_header_only_when_it_has_the_bots_header_and_no_text_from_the_sender(
+        caption, parse_mode, header_only):
+    assert _header_only(caption, parse_mode) is header_only
 
 
 @pytest.mark.parametrize("spelling", sorted(set(ROW_SPELLINGS) - {"absent"}))
