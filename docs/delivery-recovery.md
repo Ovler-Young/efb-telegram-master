@@ -243,7 +243,7 @@ below lists only events on an existing row.
 | record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
 | operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
 | defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
-| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting row that needs a removed row's message |
+| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
 | withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
 | discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
 

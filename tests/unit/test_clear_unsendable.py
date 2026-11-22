@@ -106,8 +106,7 @@ def test_clear_removes_only_rows_that_can_never_be_sent(tmp_path, make_queue, qu
                       cleanup=(str(present),))
     kept_text = _add(queue, "send_message", {"chat_id": -1001, "text": "text"})
     for row_id, error in ((gone_media, TimedOut()), (rejected, BadRequest("Message is too long")),
-                          (update, TimedOut()), (edit, TimedOut()), (source, TimedOut()),
-                          (kept_media, TimedOut())):
+                          (edit, TimedOut()), (source, TimedOut()), (kept_media, TimedOut())):
         _hold(queue, row_id, error)
     _copy_payload(queue, source, rejected)  # A removed row and a kept row name one file.
     gone.unlink()

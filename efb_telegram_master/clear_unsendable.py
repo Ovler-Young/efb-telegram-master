@@ -104,17 +104,6 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[st
             if reason is not None:
                 removed[row_id] = reason
 
-    contexts: dict[int, dict | None] = {}
-
-    def context(row_id: int) -> dict | None:
-        if row_id not in contexts:
-            value = run("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,))[0][0]
-            try:
-                contexts[row_id] = None if value is None else decode_aggregation(bytes(value))
-            except Exception:  # noqa: BLE001 - unpickling a damaged context can raise anything
-                contexts[row_id] = None
-        return contexts[row_id]
-
     pending = list(removed)
     while pending:
         predecessor = pending.pop()
@@ -122,7 +111,11 @@ def _clear(run: Callable, media_dir: Path) -> tuple[dict[int, str], dict, set[st
             state = states[row_id]
             if row_id in removed or (state not in _WAITING and next_state(state, Event.DISCARD) is None):
                 continue
-            own = context(row_id)
+            value = run("SELECT log_context FROM outbound_queue WHERE id=?", (row_id,))[0][0]
+            try:
+                own = None if value is None else decode_aggregation(bytes(value))
+            except Exception:  # noqa: BLE001 - unpickling a damaged context can raise anything
+                own = None
             if own is not None and own.get("kind") == ContextKind.MEMBER_UPDATE and not own.get("container_id"):
                 removed[row_id] = NEEDS_REMOVED_ROW
                 pending.append(row_id)
