@@ -393,6 +393,72 @@ def test_logged_messages_bound_the_span_only_when_the_chat_agrees(manager, monke
         assert applied == [] and counts["ambiguous"] == 1
 
 
+def test_a_logged_message_dated_just_before_the_attempt_does_not_hide_a_delivery(manager, monkeypatch):
+    """The host clock runs a few seconds ahead of Telegram's: the delivery is dated 2 s before the attempt, and a
+    combined message sent right after it is dated 1 s before it while logged with its first source's older time."""
+    monkeypatch.setattr(dc, "PACE", 0.0)
+    attempt = time.time() - 3600
+    local = datetime.datetime.fromtimestamp
+    log(manager, 100, local(attempt - 60))
+    log(manager, 120, local(attempt - 30))
+    log(manager, 130, local(attempt + 900))
+    messages = {
+        100: real_message(100, "logged before", attempt - 60),
+        108: real_message(108, "second", attempt - 2),
+        120: real_message(120, "combined, sent late", attempt - 1),
+        130: real_message(130, "logged after", attempt + 900),
+    }
+    row = HeldRow(2, CHAT, "send_message", payload(text="second"), "mod.chat", None, attempt, "uncertain:TimedOut")
+
+    applied, counts = check_one(manager, row, messages)
+
+    assert applied == [] and counts["ambiguous"] == 1
+
+
+def test_a_dropped_read_session_is_opened_again_by_the_next_pass(manager, monkeypatch):
+    monkeypatch.setattr(dc, "PACE", 0.0)
+    attempt = time.time() - 3600
+    log(manager, 100, datetime.datetime.fromtimestamp(attempt - 60))
+    messages = {100: real_message(100, "logged before", attempt - 60), 108: real_message(108, "second", attempt + 20),
+                130: real_message(130, "logged after", attempt + 1000)}
+    built = []
+
+    class Dropped(RecordingClient):
+        """A client whose connection is gone: every request raises until it is replaced."""
+        dropped = False
+
+        async def __call__(self, request):
+            if self.dropped:
+                raise ConnectionError("Cannot send requests while disconnected")
+            return await super().__call__(request)
+
+    def factory():
+        built.append(Dropped(messages))
+        return built[-1]
+
+    def held_row(row_id):
+        return HeldRow(row_id, CHAT, "send_message", payload(text="second"), "mod.chat", None, attempt, "uncertain:TimedOut")
+
+    rows = [held_row(2)]
+    applied = []
+    check = HeldSendCheck(
+        api_id=1, api_hash="h", tokens={None: f"{BOT}:secret"}, db=manager, list_rows=lambda: rows,
+        resolve=lambda row_id, verdict, seen_message, bot: applied.append((row_id, verdict, seen_message and seen_message.id)) or True,
+        client_factory=factory)
+
+    async def passes():
+        first = await check.run_pass()
+        built[0].dropped = True
+        rows[:] = [held_row(3)]
+        return first, await check.run_pass(), await check.run_pass()
+
+    first, failed, again = asyncio.run(passes())
+
+    assert first["found"] == 1 and failed["bot_failed"] == 1
+    assert again["found"] == 1 and applied == [(2, Verdict.FOUND, 108), (3, Verdict.FOUND, 108)]
+    assert len(built) == 2 and built[0].disconnected
+
+
 def test_a_logged_message_the_chat_does_not_show_bounds_nothing(manager, monkeypatch):
     monkeypatch.setattr(dc, "PACE", 0.0)
     attempt = time.time() - 3600

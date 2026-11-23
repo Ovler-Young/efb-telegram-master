@@ -592,6 +592,9 @@ class HeldSendCheck:
             if isinstance(result, BaseException):
                 counts["bot_failed"] += 1
                 logger.warning("Held-send check could not read as one bot: %s", type(result).__name__)
+                # the session may have dropped for good: forget it, so the next pass logs in again
+                with contextlib.suppress(Exception):
+                    await self._readers.pop(bot).close()
             else:
                 counts.update(result)
         logger.info("Held-send check pass: %s", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no rows")
@@ -657,7 +660,7 @@ class HeldSendCheck:
         await self._read(reader, store, asked, keys.chat_id, neighbours)
         lower = chat.get(before) if before is not None else None
         upper = chat.get(after) if after is not None else None
-        if ((before is not None and (lower is None or lower.date > keys.attempt))
+        if ((before is not None and (lower is None or lower.date > keys.attempt - PRE))
                 or (after is not None and (upper is None or upper.date <= window_end))
                 or (before is not None and after is not None and after <= before)):
             state = ReadState.UNTRUSTED

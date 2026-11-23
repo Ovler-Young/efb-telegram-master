@@ -104,7 +104,7 @@ message it changes shows its text.
 | no such message, and the check already sent this row once | Nothing: the row stays held. A row is sent again by the check at most once. |
 | no such message, the attempt is less than a day old and every media file it names is still there | Clears the hold, so the send goes out again, after the messages sent since. An edit is handled differently when it has a newer edit: a later queued row edits the same message with its complete text (as for the retry of an edit above; a later update of a combined message does not count), or the chat shows a standalone message edited after the attempt (the edit date of a combined message does not count). Such an edit is dropped, except an edit that appends new messages to a combined message, which stays held. |
 | no such message, otherwise | Discards the row, with the container edits that need it (as `needs_removed_row` below). A queue-owned file is deleted only when no remaining row names it; external media files are never deleted. |
-| nothing that decides it (several candidates, a near miss with other text, a span it could not close, logged messages the chat does not confirm as bounds) | Nothing: the row stays held. It is read again after a restart. |
+| nothing that decides it (look-alike sends with fewer matching messages than rows, a near miss with other text, a span it could not close, logged messages the chat does not confirm as bounds) | Nothing: the row stays held. It is read again after a restart. |
 
 A discarded or confirmed row never needs `/confirm_send`; the command still works
 for every row the check leaves held. Each pass logs one line with counts only,
@@ -266,7 +266,8 @@ Every row of the outbound queue (the `outbound_queue` table, in `outbound-queue.
 on SQLite and in the same PostgreSQL schema as the message tables on PostgreSQL) is in
 exactly one state, read from its `delivery_state` and `delivery_hold` columns (and `reconcile_after` for a
 deferred row). `hold_reason` only explains a hold with the error's text, and
-`unconfirmed_at` only marks an edit whose earlier try Telegram did not confirm;
+`unconfirmed_at` only marks an edit whose earlier try Telegram did not confirm,
+or a send the chat check sent again;
 neither decides a state. A queue written by an earlier version gains both
 columns when this version opens it (SQLite) or at database startup
 (PostgreSQL); rows from before then have them empty. An earlier version still
@@ -402,7 +403,8 @@ the ids of the rows found not delivered, one per line. It opens the queue file
 and the message log read-only (SQLite `mode=ro`, or a read-only PostgreSQL
 transaction), never through the queue class, so no schema change is made to a
 file an older version owns, and it sends, edits and deletes nothing. A row the
-chat does not decide (several candidates, a near miss, an attempt less than 11
+chat does not decide (look-alike sends with fewer matching messages than
+rows, a near miss, an attempt less than 11
 minutes old, an unreadable chat or a bot that is not configured) is left out of
 the file. The output is counts only. If the pass of any bot fails (it cannot
 log in, or a read fails), it prints that and exits 1 without writing the file.
