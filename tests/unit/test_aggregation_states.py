@@ -110,7 +110,7 @@ def test_rows_of_every_kind_recover_and_reconcile(runtime, make_queue):
 def test_illegal_kind_transitions_name_the_row_and_leave_it_unchanged(runtime):
     manager = runtime
     queue = manager._outbound_queue
-    key, _ = append(manager, "one", 1)
+    append(manager, "one", 1)
     row = queue.aggregation_rows()[0]
     before = stored(manager, row.id)
     batch = decode_aggregation(row.log_context)
