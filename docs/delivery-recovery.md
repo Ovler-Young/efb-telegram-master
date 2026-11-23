@@ -102,7 +102,7 @@ message it changes shows its text.
 |---|---|
 | a matching message | Records it as the delivery, as `/confirm_send` does, and never sends the row again. The log entry has the message's id, author and media type but no Bot API file id. |
 | no such message, and the check already sent this row once | Nothing: the row stays held. A row is sent again by the check at most once. |
-| no such message, the attempt is less than a day old and every media file it names is still there | Clears the hold, so the send goes out again, after the messages sent since. An edit is handled differently when it has a newer edit: a later queued row edits the same message with its complete text (as for the retry of an edit above; a later update of a combined message does not count), or the chat shows a standalone message edited after the attempt. Such an edit is dropped, except an edit that appends new messages to a combined message, which stays held. |
+| no such message, the attempt is less than a day old and every media file it names is still there | Clears the hold, so the send goes out again, after the messages sent since. An edit is handled differently when it has a newer edit: a later queued row edits the same message with its complete text (as for the retry of an edit above; a later update of a combined message does not count), or the chat shows a standalone message edited after the attempt (the edit date of a combined message does not count). Such an edit is dropped, except an edit that appends new messages to a combined message, which stays held. |
 | no such message, otherwise | Discards the row, with the container edits that need it (as `needs_removed_row` below). A queue-owned file is deleted only when no remaining row names it; external media files are never deleted. |
 | nothing that decides it (several candidates, a near miss with other text, a span it could not close, logged messages the chat does not confirm as bounds) | Nothing: the row stays held. It is read again after a restart. |
 
@@ -214,10 +214,10 @@ waiting: queued and unheld, in flight, or delivered and awaiting its MsgLog writ
 A predecessor that is gone, permanently held, or linked into a cycle is not an
 ordering barrier — waiting for it either already happened or can never happen —
 so it cannot strand everything queued behind it. Held rows themselves are kept
-until the chat check or an operator resolves them. When every waiting row
-defers to another waiting row there is no valid order at all; the scheduler then
-dispatches the oldest row
-per destination and logs `deferred by predecessor links that never resolve`:
+until the chat check or an operator resolves them. When every waiting row defers
+to another waiting row there is no valid order at all; the scheduler then
+dispatches the oldest row per destination and logs `deferred by predecessor
+links that never resolve`:
 
 ```sql
 SELECT q.id, q.predecessor_id, p.id IS NOT NULL AS predecessor_exists

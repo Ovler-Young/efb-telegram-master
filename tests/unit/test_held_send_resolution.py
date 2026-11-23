@@ -254,6 +254,18 @@ def test_later_update_of_a_combined_message_is_not_a_newer_edit(tmp_path, make_q
     assert hold_of(queue, row_id) is None
 
 
+def test_member_update_edit_is_not_dropped_on_the_chat_edit_date(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    manager = manager_for(queue)
+    row_id = held(queue, "edit_message_text", {"chat_id": CHAT, "message_id": 50, "_required_sender_bot_id": "901",
+                                               "text": "one (edited)"}, context=_context("member_update", member=MEMBER))
+    # A later applied append moved the chat's edit date past the attempt; it says nothing about this update.
+    target = chat_message(50, "one\ntwo", edited=now())
+
+    assert manager._resolve_held_send(row_id, Verdict.NOT_FOUND, target, BOT)
+    assert row_id in rows(queue) and hold_of(queue, row_id) is None
+
+
 def test_edit_not_applied_without_a_newer_edit_is_sent_again(tmp_path, make_queue):
     queue = make_queue(tmp_path)
     manager = manager_for(queue)

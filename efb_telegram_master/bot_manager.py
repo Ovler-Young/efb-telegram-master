@@ -2149,10 +2149,11 @@ class TelegramBotManager(LocaleMixin):
         context = decode_aggregation(bytes(log_context)) if log_context else None
         appends = bool(context and context.get("members"))
         newer = self._outbound_queue.unconfirmed_edit_superseded(row_id) is not None
-        # A message edited after the attempt was edited again since. A combined message is also changed by
-        # its later updates, which are not newer edits, so this tells only for a standalone message.
+        # A standalone message edited in the chat after the attempt was edited again since. A combined message
+        # is also changed by its later updates, which are not newer edits, so for an edit with a combined-message
+        # context only the queue rule above tells.
         edited_at = target.message.edit_date if target is not None else None
-        newer = newer or (not appends and edited_at is not None and edited_at.timestamp() > attempt_started_at)
+        newer = newer or (not context and edited_at is not None and edited_at.timestamp() > attempt_started_at)
         if not newer:
             return "resend"
         # An edit that appends messages to a combined message is their only copy: it is not dropped.
