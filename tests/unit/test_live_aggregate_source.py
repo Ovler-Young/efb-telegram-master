@@ -499,9 +499,33 @@ def test_a_removal_behind_a_standalone_send_that_ended_held_is_held_and_sending_
         assert scheduler.failure is None and not scheduler.stopping
         assert not queue.contains(unrelated)
         holds = [hold for hold, in queue.connection.execute("SELECT delivery_hold FROM outbound_queue")]
-        assert "aggregation_failed:UnconfirmedContainerError" in holds
+        assert "aggregation_failed:IllegalAggregationTransitionError" in holds
         restart(manager, make_queue=make_queue)
         queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+
+
+def test_edits_that_no_longer_fit_their_combined_message_are_held_and_sending_goes_on(runtime, make_queue):
+    manager = runtime
+    handler = processor(manager)
+    append(manager, "one", 1, "first")
+    append(manager, "two", 1.1, "second")
+    manager._outbound_scheduler.dispatch_once()
+    for submitted in tuple(manager._outbound_scheduler.in_flight.values()):
+        submitted.future.result(timeout=2)
+    edit(handler, "one", "a" * 2500)
+    edit(handler, "two", "b" * 2500)
+    manager._outbound_scheduler.harvest_completed()
+    for _ in range(2):
+        run(manager, passes=4)
+        queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+        unrelated, _ = queue.enqueue_many(
+            [QueueRequest("send_message", (), {"chat_id": -200, "text": "unrelated chat"})], manager._queue_operation)
+        run(manager)
+        assert scheduler.failure is None and not scheduler.stopping
+        assert not queue.contains(unrelated)
+        holds = [hold for hold, in queue.connection.execute("SELECT delivery_hold FROM outbound_queue")]
+        assert holds == ["aggregation_failed:IllegalAggregationTransitionError"]
+        restart(manager, make_queue=make_queue)
 
 
 def test_new_messages_appended_by_an_unanswered_edit_stay_held(runtime):

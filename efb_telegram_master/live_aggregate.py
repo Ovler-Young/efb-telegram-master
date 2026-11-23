@@ -18,7 +18,7 @@ from .aggregate import (
     render_members,
 )
 from .aggregation_states import CloseReason, ContextKind, ContextState, needs_delivered_predecessor
-from .outbound import IllegalAggregationTransitionError, QueueRequest, UnconfirmedContainerError, check_receipt
+from .outbound import IllegalAggregationTransitionError, QueueRequest, check_receipt
 from .queued_log import decode_aggregation, encode_aggregation
 from .utils import removal_edit
 
@@ -360,8 +360,8 @@ class LiveTextAggregation:
                                old_message_id=tuple(int(value) for value in log.master_msg_id.rsplit(".", 1)),
                                message=message)
                 return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
-            raise UnconfirmedContainerError(row.id, context["kind"], "materialize",
-                                            "A removal edit requires its confirmed standalone message.")
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "materialize",
+                                                    "A removal edit requires its confirmed standalone message.")
         if independent and not context.get("frozen"):
             member = context["member"]
             resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),
@@ -395,7 +395,7 @@ class LiveTextAggregation:
                 member = context["updates"][0]
                 resolved = self.manager.channel.db.resolve_source_member(*member_identity(member), str(context["key"][1]), context["key"][2])
                 if not resolved or not resolved[0].aggregate:
-                    raise UnconfirmedContainerError(
+                    raise IllegalAggregationTransitionError(
                         row.id, context["kind"], "materialize",
                         "Deferred source update requires its confirmed container.")
                 context["container_id"] = resolved[0].master_msg_id

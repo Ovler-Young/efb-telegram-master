@@ -146,14 +146,13 @@ A refusal raises `IllegalAggregationTransitionError` and writes nothing. Its
 message names the row, its kind and the event, for example
 `Aggregation queue row 12 of kind 'member_update' does not accept materialize; the row was left unchanged. Existing aggregate updates require the original owner.`
 
-One case is not a stop: a queued edit or removal whose target message never came
-into being, because that message's first send ended held after a timeout or a
-rejection. Its row is held as `aggregation_failed:UnconfirmedContainerError` and
-the other rows go on.
+At the first attempt (`materialize`) such a row is held as
+`aggregation_failed:IllegalAggregationTransitionError` and the other rows go on:
+for example an edit or removal whose target message never came into being, or an
+edit that no longer fits its combined message.
 
-* **At the first attempt** (`materialize`), the outbound worker stops, as for
-  any queue persistence error, and stops again after a restart. Find the row
-  with
+* **At the Telegram call** (`execute`), the outbound worker stops, as for any
+  queue persistence error, and stops again after a restart. Find the row with
   `python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
   and report the message with the log lines around it. When the queue is in
   PostgreSQL, add `--dsn "host=... dbname=... user=..."` (the password comes
