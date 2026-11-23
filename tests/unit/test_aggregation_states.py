@@ -136,19 +136,15 @@ def test_illegal_kind_transitions_name_the_row_and_leave_it_unchanged(runtime, c
     assert stored(manager, update_id) == update_row
 
 
-def test_illegal_materialisation_stops_delivery_with_the_row_named(runtime):
+def test_an_edit_whose_container_never_existed_is_held_and_delivery_goes_on(runtime):
     manager = runtime
     key = (member_of("unsent", "body", 1)["origin_uid"], -100, None)
     # An edit of a source that never reached a container cannot become a container edit.
     row_id = manager.live_aggregation.queue_deferred_update(key, member_of("unsent", "body", 1), None)
-    before = stored(manager, row_id)
     scheduler = manager._outbound_scheduler
     scheduler.dispatch_once()
-    assert scheduler.stopping
-    assert str(scheduler.failure) == (
-        f"Aggregation queue row {row_id} of kind 'member_update' does not accept materialize; the row was left "
-        "unchanged. Deferred source update requires its confirmed container.")
-    assert stored(manager, row_id) == before
+    assert scheduler.failure is None and not scheduler.stopping
+    assert state_and_hold(manager, row_id)[1].startswith("aggregation_failed:")
 
 
 def test_confirm_send_refuses_a_batch_that_was_never_sent(runtime):

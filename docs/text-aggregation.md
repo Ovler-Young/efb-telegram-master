@@ -163,7 +163,12 @@ the outbound worker at its first attempt.
 
 The check raises `IllegalAggregationTransitionError` and writes nothing. Its
 message names the row, its kind and the event, for example
-`Aggregation queue row 12 of kind 'member_update' does not accept materialize; the row was left unchanged. Deferred source update requires its confirmed container.`
+`Aggregation queue row 12 of kind 'member_update' does not accept materialize; the row was left unchanged. Existing aggregate updates require the original owner.`
+
+One case is not a stop: a queued edit or removal whose target message never came
+into being, because that message's first send ended held after a timeout or a
+rejection. Its row is held as `aggregation_failed:UnconfirmedContainerError` and
+the other rows go on.
 
 * **At the first attempt or the Telegram call** (`materialize`, `execute`), the
   outbound worker stops, as for any queue persistence error, and stops again
