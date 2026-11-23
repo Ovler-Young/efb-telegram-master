@@ -209,6 +209,10 @@ class IllegalAggregationTransitionError(QueuePersistenceError):
         super().__init__(f"{message} {reason}" if reason else message)
 
 
+class UnconfirmedContainerError(IllegalAggregationTransitionError):
+    """The message a queued change refers to never came into being, so the change cannot be sent."""
+
+
 # A row without an aggregation context (ABSENT) is not an aggregation row: only its delivery state applies.
 _RECEIPT_STATES = frozenset({
     ContextState.ABSENT, ContextState.AGGREGATE, ContextState.FROZEN_SOURCE,
@@ -4135,6 +4139,15 @@ class OutboundQueueScheduler:
                     except InvalidQueuedPayloadError as error:
                         try:
                             self.queue.hold_invalid_payload(row.id)
+                        except Exception as persistence_error:
+                            self._stop_for_persistence_error(persistence_error)
+                            return
+                        self.queue.fail_waiter(row.id, error)
+                        self.wake_event.set()
+                        continue
+                    except UnconfirmedContainerError as error:
+                        try:
+                            self.queue.hold_failed_aggregation(row.id, error)
                         except Exception as persistence_error:
                             self._stop_for_persistence_error(persistence_error)
                             return

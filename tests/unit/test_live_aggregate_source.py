@@ -443,6 +443,67 @@ def run(manager, passes=2):
         scheduler.harvest_completed()
 
 
+@pytest.mark.parametrize("error", [NetworkError("response lost"), BadRequest("Message is too long")])
+def test_an_edit_waiting_for_a_first_send_that_ended_held_is_held_and_sending_goes_on(runtime, make_queue, error):
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    append(manager, "one", 1, "original")
+    manager.transport.error = error
+    scheduler.dispatch_once()
+    (_, submitted), = scheduler.in_flight.items()
+    submitted.future.exception(timeout=2)
+    edit(processor(manager), "one", "edited during first send")
+    update_id, = [row.id for row in queue.aggregation_rows() if decode_aggregation(row.log_context)["kind"] == "member_update"]
+    unrelated, _ = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": -200, "text": "unrelated chat"})], manager._queue_operation)
+    manager.transport.error = None
+    scheduler.harvest_completed()
+    for _ in range(2):
+        run(manager, passes=3)
+        assert scheduler.failure is None and not scheduler.stopping
+        hold, = queue.connection.execute("SELECT delivery_hold FROM outbound_queue WHERE id=?", (update_id,)).fetchone()
+        assert hold.startswith("aggregation_failed:")
+        assert not queue.contains(unrelated)
+        restart(manager, make_queue=make_queue)
+        queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    assert queue.contains(update_id)
+    assert "edit_message_text" not in [call[0] for call in manager.transport.calls]
+
+
+@pytest.mark.parametrize("error", [NetworkError("response lost"), BadRequest("Message is too long")])
+def test_a_removal_behind_a_standalone_send_that_ended_held_is_held_and_sending_goes_on(runtime, make_queue, error):
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    handler = processor(manager)
+    queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+    manager.channel.commands = SimpleNamespace(register_command=lambda receipt, context: None)
+    append(manager, "solo", 1)
+    message = source("solo", "body with action")
+    message.chat.members.append(message.author)
+    message.edit = True
+    message.commands = MessageCommands([MessageCommand(name="Action", callable_name="action")])
+    with patch("ehforwarderbot.coordinator.get_module_by_id", return_value=SimpleNamespace(action=lambda: "x")):
+        handler.send_message(message)
+        manager.transport.error = error
+        scheduler.dispatch_once()
+        for submitted in tuple(scheduler.in_flight.values()):
+            submitted.future.exception(timeout=2)
+    remove(handler, "solo")
+    unrelated, _ = queue.enqueue_many(
+        [QueueRequest("send_message", (), {"chat_id": -200, "text": "unrelated chat"})], manager._queue_operation)
+    manager.transport.error = None
+    scheduler.harvest_completed()
+    for _ in range(2):
+        run(manager, passes=3)
+        assert scheduler.failure is None and not scheduler.stopping
+        assert not queue.contains(unrelated)
+        holds = [hold for hold, in queue.connection.execute("SELECT delivery_hold FROM outbound_queue")]
+        assert "aggregation_failed:UnconfirmedContainerError" in holds
+        restart(manager, make_queue=make_queue)
+        queue, scheduler = manager._outbound_queue, manager._outbound_scheduler
+
+
 def test_new_messages_appended_by_an_unanswered_edit_stay_held(runtime):
     """The edit is the only copy of the appended messages, so it is held like a send."""
     manager = runtime
