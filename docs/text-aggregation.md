@@ -28,7 +28,7 @@ edited text.
 ### Events and allowed changes
 
 The definition lives in `efb_telegram_master/aggregate.py`: `MemberStatus`,
-`MemberEvent`, the table `MEMBER_TRANSITIONS`, and `apply_member_event()`.
+`MemberEvent`, and `apply_member_event()`.
 These call it: receipts and redirects in the `finalize_*` methods of `db.py`,
 the preview of a container update in `LiveTextAggregation.materialize`,
 removals in `remove_source_member`, and source edits in `slave_message.py`.
@@ -39,20 +39,19 @@ the batch carried them. `redirect` leaves `replacement_master_msg_id` to
 `finalize_member_redirect`, which sets it once the replacement output is
 saved.
 
-| Event | From | To | Notes |
-|---|---|---|---|
-| `new_revision` | none, `active`, `removed`, `redirected` | `active` | The revision must grow. From `redirected` it is reachable only while a routing update of the old container is queued. |
-| `remove` | `active`, `removed`, `redirected` | `removed` | Revision + 1. Removing a removed member changes nothing. From `redirected` it is reachable only while a routing update of the old container is queued. |
-| `redirect` | `active`, `removed`, `redirected` | `redirected` | The replacement must be a version at least as new; an already confirmed redirect changes nothing. |
-| `receipt` (container) | `active`, `removed` | `active`, `removed` | The receipt's copy (`active` or `removed`) replaces the saved one when its revision is newer, or equal while the saved copy is `active`. |
-| `receipt` (container) | `redirected` | `redirected` | Confirmed replacement routing survives every container receipt. |
-| `source_receipt` (independent output) | none, any | `active`, `removed` | Only a strictly newer revision replaces the saved member. |
-| `stale_receipt` | any | unchanged | Reported when a receipt is older than what is saved; nothing is written. |
+A newer revision wins: a `new_revision` must advance the revision, and
+removing a removed member changes nothing. A `redirect` needs a version at
+least as new as the saved one, and an already confirmed redirect changes
+nothing. A container receipt replaces the saved member when its revision is
+newer, or equal while the saved member is `active`; confirmed replacement
+routing (`redirected`) survives every container receipt. An independent
+output's receipt replaces the saved member only with a strictly newer
+revision. A receipt older than what is saved is reported as `stale_receipt`
+and nothing is written.
 
-A combination that is not in the table, a `new_revision` that does not advance
-the revision, or a redirect of an older version over a newer one raises
-`MemberTransitionError` (a `ValueError`). The message names the member, the
-event and its current status, for example
+A `new_revision` that does not advance the revision, or a redirect of an
+older version over a newer one, raises `MemberTransitionError` (a
+`ValueError`). The message names the member, for example
 `Source member ('module.chat', 'msg-1') revision 2 does not follow 2.` or
 `A stale receipt cannot redirect a newer source version.` Such an error
 means a receipt or an edit reached a member in a state it cannot be in; the
@@ -112,14 +111,7 @@ in flight, held, `sent_pending`) are a separate machine, described in
 `docs/delivery-recovery.md`.
 
 The definition lives in `efb_telegram_master/aggregation_states.py`:
-`ContextKind` (the stored spellings), `ContextState`, `ContextEvent`, the table
-`CONTEXT_TRANSITIONS` and `context_state()`. The queue mutators in
-`outbound.py` (`replace_logical_aggregation`, `close_aggregation_destination`,
-`materialize_aggregation`, `handoff_aggregation`, `cancel_logical_aggregation`,
-`cancel_pending_source`, `release_delivery_attempt`, and the batch split in
-`enqueue_many`), `LiveTextAggregation.materialize` and `reconcile`, and
-`TelegramBotManager.execute_queued_call` check it through
-`check_context_transition()` before they write.
+`ContextKind` (the stored spellings), `ContextState` and `context_state()`.
 
 | State | Stored as | Meaning |
 |---|---|---|
@@ -133,20 +125,9 @@ The definition lives in `efb_telegram_master/aggregation_states.py`:
 | `boundary` | `kind='boundary'` | An ordinary request (media, commands, a full-content attachment) ordered between batches. It is logged through its own `legacy_context`. |
 | `cancellation` | `kind='cancellation'` in `source_cancellations` | A withdrawn unpublished member, kept so a later edit is not published. Nothing removes it: one small record per withdrawn source stays for the life of the queue file. |
 
-| Event | From | To | Where |
-|---|---|---|---|
-| `replace` | `logical`, `member_update` | same | Append a member, merge an edit or removal, keep the head of a split batch. |
-| `close_destination` | `logical`, `member_update`, `aggregate`, `handed_off` | same | A new Telegram message in the destination ends appending. Of the `handed_off` rows only a handed-off aggregate takes it, so a retried receipt cannot reopen the container. Other rows have no append flags and are skipped. |
-| `materialize` | `logical`, `member_update` | `aggregate` | First attempt. |
-| `materialize` | `source` | `frozen_source`, `frozen_redirect` | First attempt; the saved source decides which. |
-| `materialize` | `aggregate`, `frozen_source`, `frozen_redirect`, `boundary` | same | Frozen requests are sent as stored. A removal edit is rebuilt from the saved standalone message, which also upgrades a removal stored in the former `delete_message` format. |
-| `execute` | `aggregate`, `frozen_source`, `frozen_redirect`, `boundary` | same | The Telegram call. |
-| `release` | `aggregate` | `logical`, `aggregate` | A definite rejection: a new batch returns to its logical form, a container update stays frozen for its owner. |
-| `release` | `frozen_source`, `frozen_redirect`, `boundary` | same | |
-| `receipt` | `aggregate`, `frozen_source`, `frozen_redirect` | `handed_off` | Write MsgLog, update the rows behind it. |
-| `receipt` | `handed_off` | `handed_off` | A retry after the row could not be removed; nothing is applied twice. |
-| `receipt` | `boundary` | `boundary` | Logged through its `legacy_context`. |
-| `withdraw` | `logical`, `source`, `frozen_source` | none | Only before any attempt: an emptied batch, a batch replaced by its split, an unpublished member's pending outputs. |
+A row takes a Telegram receipt only when it is an aggregate, a frozen output,
+already handed off or a boundary; `check_receipt()` in `outbound.py` refuses any
+other.
 
 A row is created as `logical`, `member_update`, `source`, `frozen_source` (a
 removal edit of a confirmed standalone message) or `boundary`. Updating the
@@ -161,7 +142,7 @@ the outbound worker at its first attempt.
 
 ### When a row is in a state its event does not accept
 
-The check raises `IllegalAggregationTransitionError` and writes nothing. Its
+A refusal raises `IllegalAggregationTransitionError` and writes nothing. Its
 message names the row, its kind and the event, for example
 `Aggregation queue row 12 of kind 'member_update' does not accept materialize; the row was left unchanged. Existing aggregate updates require the original owner.`
 
@@ -170,25 +151,20 @@ At the first attempt (`materialize`) such a row is held as
 for example an edit or removal whose target message never came into being, or an
 edit that no longer fits its combined message.
 
-* **At the Telegram call** (`execute`), the outbound worker stops, as for any
-  queue persistence error, and stops again after a restart. Find the row with
-  `python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
-  and report the message with the log lines around it. When the queue is in
-  PostgreSQL, add `--dsn "host=... dbname=... user=..."` (the password comes from
-  `PGPASSWORD` or `~/.pgpass`, never the command line). An install whose
-  `database.options` sets `search_path` puts the same schema in the DSN
-  (`options=-csearch_path=<schema>`). With `--dsn`, `--data-dir` is used only
-  to size `outbound-media/`, and the script needs only `psycopg2`. Without `--dsn` it
-  refuses a data directory whose queue moved to PostgreSQL, because the retained
-  SQLite copy shows stale rows.
+Find a held row with
+`python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
+and report the message with the log lines around it. When the queue is in
+PostgreSQL, add `--dsn "host=... dbname=... user=..."` (the password comes
+from `PGPASSWORD` or `~/.pgpass`, never the command line). An install whose
+`database.options` sets `search_path` puts the same schema in the DSN
+(`options=-csearch_path=<schema>`). With `--dsn`, `--data-dir` is used only to
+size `outbound-media/`, and the script needs only `psycopg2`. Without `--dsn`
+it refuses a data directory whose queue moved to PostgreSQL, because the
+retained SQLite copy shows stale rows.
+
 * **At receipt reconciliation**, the scheduler logs once per row
   `Receipt of queue row 12 (aggregation kind 'logical') cannot be reconciled; it stays queued and is retried: ...`
   and keeps retrying on the usual backoff. Other rows continue.
-* **For a merge, a withdrawal of a pending output or a release**, the row is
-  left as it is and a WARNING says why (`Aggregation batch not replaced: ...`,
-  `Pending source not withdrawn: ...`, `Send attempt not released: ...`). A
-  refused merge or withdrawal is handled like a row that was already sent: the
-  change goes into a new row.
 
 ## Live streams
 
@@ -197,29 +173,16 @@ A live stream is the in-memory append state of one source in one destination
 rebuilt from the queued rows. It decides whether a new member joins the
 current container or starts a new one.
 
-The definition lives in `efb_telegram_master/aggregation_states.py`:
-`StreamState`, `StreamEvent`, `STREAM_TRANSITIONS` and `CloseReason`, used by
-`LiveTextAggregation` in `live_aggregate.py`.
-
-| State | Meaning |
-|---|---|
-| `absent` | No member or independent delivery for this key since startup. |
-| `open` | The next member may join the current batch or edit the current container. |
-| `closed` | The current container ended; the next member starts a new one. The container it replaced is remembered until the next close or reopen. |
-
-| Event | absent | open | closed |
-|---|---|---|---|
-| `append` | open | open | open |
-| `close` | absent (no-op) | closed | closed |
-| `reopen` | absent (no-op) | open (the remembered container is restored, if any) | open (the remembered container is restored) |
-
-`LiveTextAggregation` changes a stream's state only through `_Stream.apply`,
-which follows `STREAM_TRANSITIONS`. `reopen` acts only when the discarded row
-is still the stream's last row; otherwise a later row has already continued
-the run and nothing changes. Both no-ops are logged at DEBUG. An `append` leaves the remembered container
-alone, so a `reopen` after members were appended and withdrawn still restores
-it. A container receipt changes no stream state: it makes the confirmed container the one to
-edit next, and only when it belongs to the stream's current generation.
+The definition of `CloseReason` lives in
+`efb_telegram_master/aggregation_states.py`; `LiveTextAggregation` in
+`live_aggregate.py` closes and reopens streams. A `close` ends the current
+container and remembers it until the next close or reopen. A `reopen` restores
+the remembered container, and acts only when the discarded row is still the
+stream's last row; otherwise a later row has already continued the run and
+nothing changes. An append leaves the remembered container alone, so a
+`reopen` after members were appended and withdrawn still restores it. A
+container receipt changes no stream state: it makes the confirmed container the
+one to edit next, and only when it belongs to the stream's current generation.
 
 Every close names its reason (`CloseReason`):
 

@@ -248,7 +248,7 @@ def test_capacity_uses_parsed_text_and_keeps_removed_source_content():
     assert render_members(removed, history=True).text.count("saved") == 200
 
 
-def test_member_events_follow_the_transition_table():
+def test_member_events_follow_the_revision_order():
     from efb_telegram_master.aggregate import (
         MemberEvent,
         MemberStatus,
@@ -268,10 +268,6 @@ def test_member_events_follow_the_transition_table():
     assert (revived["status"], revived["source_revision"]) == (MemberStatus.ACTIVE, 3)
     with pytest.raises(MemberTransitionError):
         apply_member_event(revived, MemberEvent.NEW_REVISION, edit)
-    with pytest.raises(MemberTransitionError):
-        apply_member_event(None, MemberEvent.REMOVE)
-    with pytest.raises(MemberTransitionError):
-        apply_member_event(None, MemberEvent.REDIRECT, edit)
 
     redirected = apply_member_event(active, MemberEvent.REDIRECT, active)
     assert redirected.member["status"] == MemberStatus.REDIRECTED

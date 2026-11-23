@@ -17,11 +17,8 @@ from .aggregate import (
     MemberEvent, MemberStatus, aggregate_fits, apply_member_event, make_aggregate, member_identity, member_message,
     render_members,
 )
-from .aggregation_states import (
-    CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, needs_delivered_predecessor,
-    next_stream_state,
-)
-from .outbound import IllegalAggregationTransitionError, QueueRequest, check_context_transition
+from .aggregation_states import CloseReason, ContextKind, ContextState, needs_delivered_predecessor
+from .outbound import IllegalAggregationTransitionError, QueueRequest, check_receipt
 from .queued_log import decode_aggregation, encode_aggregation
 from .utils import removal_edit
 
@@ -33,26 +30,19 @@ class _Stream:
     recent: list[float] = field(default_factory=list)
     last_new: float = 0
     generation: int = 0
-    state: StreamState = StreamState.OPEN
     # The (base, generation) the latest close replaced. Only a close overwrites it
     # and only a reopen consumes it; an append leaves it alone.
     closed: Optional[tuple] = None
 
-    def apply(self, event: StreamEvent) -> None:
-        """Move this stream along ``STREAM_TRANSITIONS``."""
-        after = next_stream_state(self.state, event)
-        if after is StreamState.CLOSED:
-            self.closed = (self.base, self.generation)
-            self.base = None
-            self.generation += 1
-        elif event is StreamEvent.REOPEN and self.closed is not None:
+    def close(self) -> None:
+        self.closed = (self.base, self.generation)
+        self.base = None
+        self.generation += 1
+
+    def reopen(self) -> None:
+        if self.closed is not None:
             self.base, self.generation = self.closed
             self.closed = None
-        self.state = after
-
-
-def _stream_state(stream: _Stream | None) -> StreamState:
-    return StreamState.ABSENT if stream is None else stream.state
 
 
 # Rows that end a container: later members of the source start a new one.
@@ -140,11 +130,10 @@ class LiveTextAggregation:
         no clue which rule did it.
         """
         stream = self.streams.get(tuple(key))
-        if next_stream_state(_stream_state(stream), StreamEvent.CLOSE) is StreamState.ABSENT:
+        if stream is None:
             logging.getLogger(__name__).debug("No live aggregation stream to close for %s (%s).", key, reason)
         else:
-            assert stream is not None
-            stream.apply(StreamEvent.CLOSE)
+            stream.close()
             # One line a minute, with a tally: every container close splits a run,
             # and which rule did it is the only way to tell why. Unthrottled, this
             # would flood an active chat.
@@ -176,7 +165,7 @@ class LiveTextAggregation:
             return
         predecessor = row.predecessor_id
         stream.tail = predecessor if predecessor and self.queue.contains(predecessor) else None
-        stream.apply(StreamEvent.REOPEN)
+        stream.reopen()
         self.scheduler.wake_event.set()
 
     def close_destination(self, chat_id, topic):
@@ -233,7 +222,6 @@ class LiveTextAggregation:
                         context.update(waiting=True, due=context["members"][0]["received_time"].timestamp()
                                        + float(self.manager.channel.flag("text_aggregation_window_seconds")))
                     if self.queue.replace_logical_aggregation(stream.tail, encode_aggregation(context)):
-                        stream.apply(StreamEvent.APPEND)
                         self.pending_sources[identity] = stream.tail
                         self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
                         self.scheduler.wake_event.set()
@@ -260,7 +248,6 @@ class LiveTextAggregation:
                                    encode_aggregation(context), predecessor_id=predecessor)
             row_id, _ = self.queue.enqueue_many([request], self.manager._queue_operation)
             stream.tail = row_id
-            stream.apply(StreamEvent.APPEND)
             self.pending_sources[identity] = row_id
             self.queue.observe_metrics(lambda metrics: metrics.record_aggregation_source())
             self.scheduler.wake_event.set()
@@ -373,7 +360,7 @@ class LiveTextAggregation:
                                old_message_id=tuple(int(value) for value in log.master_msg_id.rsplit(".", 1)),
                                message=message)
                 return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "materialize",
                                                     "A removal edit requires its confirmed standalone message.")
         if independent and not context.get("frozen"):
             member = context["member"]
@@ -409,7 +396,7 @@ class LiveTextAggregation:
                 resolved = self.manager.channel.db.resolve_source_member(*member_identity(member), str(context["key"][1]), context["key"][2])
                 if not resolved or not resolved[0].aggregate:
                     raise IllegalAggregationTransitionError(
-                        row.id, context["kind"], ContextEvent.MATERIALIZE,
+                        row.id, context["kind"], "materialize",
                         "Deferred source update requires its confirmed container.")
                 context["container_id"] = resolved[0].master_msg_id
             log = self.manager.channel.db.get_msg_log(master_msg_id=context["container_id"])
@@ -421,7 +408,7 @@ class LiveTextAggregation:
                     children[index] = apply_member_event(previous, MemberEvent.RECEIPT, update).member
             if not self.fits(children, updating=True, confirmed=log.aggregate):
                 raise IllegalAggregationTransitionError(
-                    row.id, context["kind"], ContextEvent.MATERIALIZE,
+                    row.id, context["kind"], "materialize",
                     "Source changes require independent output before container update.")
             base = dict(message_id=int(log.master_msg_id.rsplit(".", 1)[1]), owner=log.sender_bot_id,
                         aggregate=log.aggregate)
@@ -435,7 +422,7 @@ class LiveTextAggregation:
                     and (context["kind"] == ContextKind.MEMBER_UPDATE
                          or self.fits(base["aggregate"]["children"] + members, confirmed=base["aggregate"])))
         if context["kind"] == ContextKind.MEMBER_UPDATE and not can_edit:
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "materialize",
                                                     "Existing aggregate updates require the original owner.")
         if children is None:
             children = base["aggregate"]["children"] + members if can_edit else members
@@ -471,9 +458,9 @@ class LiveTextAggregation:
         context = decode_aggregation(row.log_context)
         if context is None:
             return False
-        state = check_context_transition(row.id, context, ContextEvent.RECEIPT)
+        state = check_receipt(row.id, context)
         if state is ContextState.BOUNDARY:
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.RECEIPT,
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "receipt",
                                                     "A boundary row is reconciled through its own MsgLog context.")
         if context["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}:
             return self._reconcile_source(row, receipt, sender_bot_id, context, file_bot_id)
