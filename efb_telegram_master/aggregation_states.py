@@ -1,4 +1,4 @@
-"""Queued aggregation context kinds and live streams: states, events and allowed transitions.
+"""Queued aggregation context kinds: states, events and allowed transitions.
 
 An aggregation queue row stores its workflow step in ``log_context``: the
 marker byte ``\\x03`` and a pickled dict whose ``kind`` is one of the
@@ -12,9 +12,6 @@ state an event does not accept is rejected or reported instead of changed.
 
 The delivery columns of the same row (queued, in flight, held, sent_pending)
 are a separate machine in ``delivery_states``.
-
-A live stream is the in-memory append eligibility of one source key; it is
-rebuilt from queue rows at startup and is never persisted.
 """
 from enum import Enum
 
@@ -147,21 +144,6 @@ def needs_delivered_predecessor(context: dict, predecessor: dict | None) -> bool
     return False
 
 
-# Live streams. A stream exists once a source key has had a member or an
-# independent delivery in this process (or a queued row at startup).
-
-class StreamState(Enum):
-    ABSENT = "absent"  # no stream for this source key
-    OPEN = "open"      # the next member may join the current container or batch
-    CLOSED = "closed"  # the current container ended; the next member starts a new one
-
-
-class StreamEvent(Enum):
-    APPEND = "append"    # a new member is queued for this key
-    CLOSE = "close"      # end the current container (see CloseReason)
-    REOPEN = "reopen"    # the row that closed it was discarded before reaching Telegram
-
-
 class CloseReason:
     """Why a container closed; logged and counted, never persisted."""
 
@@ -175,25 +157,3 @@ class CloseReason:
     @classmethod
     def split_tail(cls, kind: str) -> str:
         return cls.SPLIT_TAIL + kind
-
-
-# Every pair is listed: an event with no effect in a state is an explicit no-op.
-STREAM_TRANSITIONS: dict[tuple[StreamState, StreamEvent], StreamState] = {
-    (StreamState.ABSENT, StreamEvent.APPEND): StreamState.OPEN,
-    (StreamState.OPEN, StreamEvent.APPEND): StreamState.OPEN,
-    (StreamState.CLOSED, StreamEvent.APPEND): StreamState.OPEN,
-    (StreamState.ABSENT, StreamEvent.CLOSE): StreamState.ABSENT,  # nothing to close
-    (StreamState.OPEN, StreamEvent.CLOSE): StreamState.CLOSED,
-    (StreamState.CLOSED, StreamEvent.CLOSE): StreamState.CLOSED,
-    # Reopening acts only when the discarded row is still the stream's tail;
-    # otherwise a later row has already continued the run.
-    (StreamState.ABSENT, StreamEvent.REOPEN): StreamState.ABSENT,
-    (StreamState.OPEN, StreamEvent.REOPEN): StreamState.OPEN,
-    (StreamState.CLOSED, StreamEvent.REOPEN): StreamState.OPEN,
-}
-# A container receipt changes no stream state: it only sets the container to
-# edit next, and only for the stream's current generation.
-
-
-def next_stream_state(state: StreamState, event: StreamEvent) -> StreamState:
-    return STREAM_TRANSITIONS[(state, event)]

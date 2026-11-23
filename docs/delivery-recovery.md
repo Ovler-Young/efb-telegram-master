@@ -320,29 +320,9 @@ were ordered behind a removed row (`released`), and deleted files. To undo `--ap
 from a backup taken before it.
 
 A new row is written as waiting by `OutboundQueue.enqueue_many`, the aggregation
-handoff and the supplement insert; it has no earlier state to check, so the table
-below lists only events on an existing row.
-
-| Event | From | To | Code |
-|---|---|---|---|
-| begin_attempt | waiting, deferred | in_flight | `begin_delivery_attempt` (an aggregation row that `materialize` already moved to in_flight is left unchanged) |
-| materialize | waiting, deferred | in_flight | `materialize_aggregation` |
-| release_attempt | in_flight | waiting | `release_delivery_attempt` (submission failed or Telegram definitely rejected; an aggregate rewinds to its logical batch) |
-| hold_uncertain | waiting, deferred, in_flight | uncertain | `hold_uncertain_delivery` |
-| operator_hold | waiting, deferred, in_flight, uncertain | uncertain | `python -m efb_telegram_master.hold_send --apply` |
-| hold_invalid_payload | waiting, deferred, in_flight | invalid_payload | `hold_invalid_payload` |
-| hold_failed_history / hold_failed_supplement | waiting, deferred, in_flight | history_failed / supplement_failed | `hold_failed_history` |
-| hold_failed_aggregation | waiting, deferred, in_flight | aggregation_failed | `hold_failed_aggregation` |
-| defer_acquisition | waiting, deferred, in_flight | deferred | `defer_acquisition` (counts a failed attempt unless a flood wait caused it) |
-| defer_failed_send | waiting, deferred | deferred | `defer_failed_send`, after the attempt was released (counts a failed attempt and, from the 3rd, stores the backoff; earlier ones leave the state as it was; a flood wait is retried without it) |
-| record_completion | waiting, deferred, in_flight | sent_pending | `record_telegram_completion` |
-| operator_confirm | in_flight, every held state | sent_pending | `/confirm_send` (`confirm_queued_delivery`); refused for an aggregation row whose context takes no receipt (an unsent batch or deferred member update) |
-| defer_reconciliation | sent_pending | sent_pending | `defer_reconciliation` |
-| remove | waiting, deferred, in_flight, sent_pending | absent | `delete` (success, or a failure that is discarded instead of held); `clear_unsendable --apply` for a waiting container edit that has no container yet (`needs_removed_row`) |
-| withdraw | waiting, deferred | absent | `cancel_logical_aggregation`, `cancel_pending_source`, and `enqueue_many` when the rows of a split replace their batch; only before any attempt started |
-| discard | every held state except unrecognized hold | absent | `python -m efb_telegram_master.clear_unsendable --apply`, for a row that can never be sent (above) |
-| replace_request | every held state except unrecognized hold | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send whose file is gone and whose caption has text from the sender (above) |
-| resend | uncertain | waiting | `python -m efb_telegram_master.clear_unsendable --apply`, for a listed send held after a timeout or a cut connection whose files are all there (above) |
+handoff and the supplement insert; it has no earlier state to check, so
+`TRANSITIONS` in `efb_telegram_master/delivery_states.py` lists only events on
+an existing row, with the states each may lead to.
 
 An event the row's state does not accept is never applied. The queue raises
 `IllegalDeliveryTransitionError` with a message such as `Queue row 12 is

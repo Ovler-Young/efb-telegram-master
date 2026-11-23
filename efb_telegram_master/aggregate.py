@@ -94,34 +94,8 @@ class MemberEvent:
     STALE_RECEIPT = "stale_receipt"
 
 
-# (status before, event) -> statuses the saved member may have afterwards. None means "no saved member".
-MEMBER_TRANSITIONS: dict[tuple[str | None, str], tuple[str, ...]] = {
-    (None, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
-    (MemberStatus.ACTIVE, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
-    # An edit after a removal makes the source live again, with a newer revision.
-    (MemberStatus.REMOVED, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
-    # Reachable while a routing update of the old container is still queued.
-    (MemberStatus.REDIRECTED, MemberEvent.NEW_REVISION): (MemberStatus.ACTIVE,),
-    (MemberStatus.ACTIVE, MemberEvent.REMOVE): (MemberStatus.REMOVED,),
-    (MemberStatus.REMOVED, MemberEvent.REMOVE): (MemberStatus.REMOVED,),
-    # Reachable while a routing update of the old container is still queued.
-    (MemberStatus.REDIRECTED, MemberEvent.REMOVE): (MemberStatus.REMOVED,),
-    (MemberStatus.ACTIVE, MemberEvent.REDIRECT): (MemberStatus.REDIRECTED,),
-    (MemberStatus.REMOVED, MemberEvent.REDIRECT): (MemberStatus.REDIRECTED,),
-    (MemberStatus.REDIRECTED, MemberEvent.REDIRECT): (MemberStatus.REDIRECTED,),
-    (MemberStatus.ACTIVE, MemberEvent.RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
-    (MemberStatus.REMOVED, MemberEvent.RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
-    # Confirmed replacement routing survives every later container receipt.
-    (MemberStatus.REDIRECTED, MemberEvent.RECEIPT): (MemberStatus.REDIRECTED,),
-    (None, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
-    (MemberStatus.ACTIVE, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
-    (MemberStatus.REMOVED, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
-    (MemberStatus.REDIRECTED, MemberEvent.SOURCE_RECEIPT): (MemberStatus.ACTIVE, MemberStatus.REMOVED),
-}
-
-
 class MemberTransitionError(ValueError):
-    """A member event that the transition table or the revision order does not allow."""
+    """A member event that the revision order does not allow."""
 
 
 class MemberChange(NamedTuple):
@@ -138,15 +112,12 @@ def apply_member_event(previous: SourceMember | None, event: str,
     ``incoming`` is the newer version for ``NEW_REVISION``, ``REDIRECT`` and both receipts.
     ``REMOVE`` needs only ``previous``. A receipt older than ``previous`` is reported as
     ``STALE_RECEIPT`` with ``changed`` False and ``previous`` returned; ``REDIRECT`` of a newer
-    source version, ``NEW_REVISION`` that does not advance the revision, and every pair missing from
-    ``MEMBER_TRANSITIONS`` raise ``MemberTransitionError``. The input members are never modified.
+    source version and ``NEW_REVISION`` that does not advance the revision raise
+    ``MemberTransitionError``. The input members are never modified.
     """
     before = previous["status"] if previous is not None else None
     known = previous if previous is not None else incoming
     identity = member_identity(known) if known is not None else None
-    allowed = MEMBER_TRANSITIONS.get((before, event))
-    if allowed is None:
-        raise MemberTransitionError(f"Source member {identity} cannot take event {event!r} while {before!r}.")
     if event == MemberEvent.REMOVE:
         assert previous is not None
         if before == MemberStatus.REMOVED:
@@ -182,9 +153,6 @@ def apply_member_event(previous: SourceMember | None, event: str,
         if previous is not None and before == MemberStatus.REDIRECTED and event == MemberEvent.RECEIPT:
             member["status"] = MemberStatus.REDIRECTED
             member["replacement_master_msg_id"] = previous["replacement_master_msg_id"]
-    if member["status"] not in allowed:
-        raise MemberTransitionError(
-            f"Source member {identity} cannot become {member['status']!r} through {event!r} while {before!r}.")
     return MemberChange(member, event, True)
 
 
