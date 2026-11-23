@@ -15,9 +15,6 @@ from .locale_mixin import LocaleMixin
 from .ptb_compat import Filters, sync_reply_text
 from .selection_session import (
     SESSION_SECONDS,
-    SelectionEvent,
-    SelectionState,
-    advance,
     expire_stale,
     find_session,
     is_owner,
@@ -38,7 +35,6 @@ class ChatSelection:
     origins: list[EFBChannelChatIDStr]
     expires_at: float
     message_id: Optional[int] = None
-    state: SelectionState = SelectionState.OPEN
 
 
 class AggregationSettings(LocaleMixin):
@@ -144,7 +140,6 @@ class AggregationSettings(LocaleMixin):
             if index >= len(selection.origins):
                 return self.bot.answer_callback_query(query.id, text=self._('Invalid selection.'))
             if action == 'page':
-                advance(self.sessions, token, selection, SelectionEvent.PAGE)
                 self.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message.message_id,
                                                     reply_markup=self._keyboard(token, selection, index))
             else:
@@ -152,7 +147,7 @@ class AggregationSettings(LocaleMixin):
                 if origin not in self._origins(message):
                     return self.bot.answer_callback_query(query.id, text=self._('The chat binding changed. Send /aggregation again.'))
                 text = self._apply(origin, selection.action)
-                advance(self.sessions, token, selection, SelectionEvent.SELECT)
+                self.sessions.pop(token, None)
                 self.bot.edit_message_text(chat_id=message.chat.id, message_id=message.message_id,
                                            text=text, reply_markup=None)
             self.bot.answer_callback_query(query.id)

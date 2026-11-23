@@ -13,9 +13,6 @@ from .aggregate import MemberStatus, member_identity, member_message, utf16_leng
 from .ptb_compat import sync_reply_text
 from .selection_session import (
     SESSION_SECONDS,
-    SelectionEvent,
-    SelectionState,
-    advance,
     expire_stale,
     find_session,
     is_owner,
@@ -60,7 +57,6 @@ class MemberSelection:
     identities: list[SourceIdentity]
     expires_at: float
     message_id: Optional[int] = None
-    state: SelectionState = SelectionState.OPEN
 
 
 class SourceMemberSelector:
@@ -172,7 +168,7 @@ class SourceMemberSelector:
                                         _force_main_bot=True)
                 session.message_id = reply.message_id
             except Exception:
-                advance(self.sessions, token, session, SelectionEvent.INVALIDATE)
+                self.sessions.pop(token, None)
                 raise
 
     def keyboard(self, token: str, session: MemberSelection, target: 'MsgLog', page: int):
@@ -215,17 +211,15 @@ class SourceMemberSelector:
             index = int(argument)
             if action == 'p' and 0 <= index <= (len(session.identities) - 1) // self.PAGE_SIZE:
                 if not all(self.resolve(target, identity) for identity in session.identities):
-                    advance(self.sessions, token, session, SelectionEvent.INVALIDATE)
+                    self.sessions.pop(token, None)
                     return self.processor.bot.answer_callback_query(query.id, text=self.processor._(
                         'Source messages have changed. Please retry the reply or /rm.'))
-                advance(self.sessions, token, session, SelectionEvent.PAGE)
                 self.processor.bot.edit_message_reply_markup(chat_id=session.chat_id, message_id=session.message_id,
                                                              reply_markup=self.keyboard(token, session, target, index))
                 return self.processor.bot.answer_callback_query(query.id)
             if action != 'c' and (action != 's' or not 0 <= index < len(session.identities)):
                 return self.processor.bot.answer_callback_query(query.id)
-            advance(self.sessions, token, session,
-                    SelectionEvent.CANCEL if action == 'c' else SelectionEvent.SELECT)
+            self.sessions.pop(token, None)
             self.processor.bot.edit_message_reply_markup(chat_id=session.chat_id, message_id=session.message_id,
                                                          reply_markup=None)
             self.processor.bot.answer_callback_query(query.id)
