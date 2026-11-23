@@ -373,8 +373,8 @@ class LiveTextAggregation:
                                old_message_id=tuple(int(value) for value in log.master_msg_id.rsplit(".", 1)),
                                message=message)
                 return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
-                                                    "A removal edit requires its confirmed standalone message.")
+            raise UnconfirmedContainerError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+                                            "A removal edit requires its confirmed standalone message.")
         if independent and not context.get("frozen"):
             member = context["member"]
             resolved = self.manager.channel.db.resolve_source_member(*member_identity(member),

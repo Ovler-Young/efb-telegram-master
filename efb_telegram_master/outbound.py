@@ -210,7 +210,7 @@ class IllegalAggregationTransitionError(QueuePersistenceError):
 
 
 class UnconfirmedContainerError(IllegalAggregationTransitionError):
-    """A waiting edit's container never came into being, so the edit cannot be sent."""
+    """The message a queued change refers to never came into being, so the change cannot be sent."""
 
 
 def check_context_transition(
