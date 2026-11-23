@@ -209,10 +209,6 @@ class IllegalAggregationTransitionError(QueuePersistenceError):
         super().__init__(f"{message} {reason}" if reason else message)
 
 
-class UnconfirmedContainerError(IllegalAggregationTransitionError):
-    """The message a queued change refers to never came into being, so the change cannot be sent."""
-
-
 def check_context_transition(
     row_id: int, context: dict | None, event: ContextEvent, target: dict | None = None, *, reason: str = "",
 ) -> ContextState:
@@ -4185,7 +4181,7 @@ class OutboundQueueScheduler:
                         self.queue.fail_waiter(row.id, error)
                         self.wake_event.set()
                         continue
-                    except UnconfirmedContainerError as error:
+                    except IllegalAggregationTransitionError as error:
                         try:
                             self.queue.hold_failed_aggregation(row.id, error)
                         except Exception as persistence_error:
