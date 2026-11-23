@@ -21,7 +21,7 @@ from .aggregation_states import (
     CloseReason, ContextEvent, ContextKind, ContextState, StreamEvent, StreamState, needs_delivered_predecessor,
     next_stream_state,
 )
-from .outbound import IllegalAggregationTransitionError, QueueRequest, check_context_transition
+from .outbound import IllegalAggregationTransitionError, QueueRequest, UnconfirmedContainerError, check_context_transition
 from .queued_log import decode_aggregation, encode_aggregation
 from .utils import removal_edit
 
@@ -408,7 +408,7 @@ class LiveTextAggregation:
                 member = context["updates"][0]
                 resolved = self.manager.channel.db.resolve_source_member(*member_identity(member), str(context["key"][1]), context["key"][2])
                 if not resolved or not resolved[0].aggregate:
-                    raise IllegalAggregationTransitionError(
+                    raise UnconfirmedContainerError(
                         row.id, context["kind"], ContextEvent.MATERIALIZE,
                         "Deferred source update requires its confirmed container.")
                 context["container_id"] = resolved[0].master_msg_id
