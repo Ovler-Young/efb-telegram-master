@@ -107,7 +107,7 @@ def test_rows_of_every_kind_recover_and_reconcile(runtime, make_queue):
     assert "media" in [call[2] for call in manager.transport.calls]
 
 
-def test_illegal_kind_transitions_name_the_row_and_leave_it_unchanged(runtime, caplog):
+def test_illegal_kind_transitions_name_the_row_and_leave_it_unchanged(runtime):
     manager = runtime
     queue = manager._outbound_queue
     key, _ = append(manager, "one", 1)
@@ -120,20 +120,7 @@ def test_illegal_kind_transitions_name_the_row_and_leave_it_unchanged(runtime, c
         manager.live_aggregation.reconcile(row, receipt, None)
     with pytest.raises(IllegalAggregationTransitionError, match=rf"row {row.id} of kind 'logical' does not accept receipt"):
         queue.handoff_aggregation(row.id, encode_aggregation(dict(batch, handoff=True)), lambda payload: payload)
-    with pytest.raises(IllegalAggregationTransitionError, match=rf"row {row.id} of kind 'logical' does not accept execute"):
-        manager.execute_queued_call(row, (), {}, None)
-    with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
-        update = dict(batch, kind="member_update", container_id="-100.1", updates=batch["members"])
-        assert not queue.replace_logical_aggregation(row.id, encode_aggregation(update))
-    assert f"row {row.id} of kind 'logical' does not accept replace" in caplog.text
-    assert "cannot become member_update" in caplog.text
     assert stored(manager, row.id) == before
-
-    update_id = manager.live_aggregation.queue_deferred_update(key, member_of("unsent", "body", 2), None)
-    update_row = stored(manager, update_id)
-    with pytest.raises(IllegalAggregationTransitionError, match=rf"row {update_id} of kind 'member_update' does not accept withdraw"):
-        queue.cancel_logical_aggregation(update_id)
-    assert stored(manager, update_id) == update_row
 
 
 def test_illegal_materialisation_stops_delivery_with_the_row_named(runtime):

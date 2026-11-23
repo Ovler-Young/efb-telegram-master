@@ -17,8 +17,8 @@ from .aggregate import (
     MemberEvent, MemberStatus, aggregate_fits, apply_member_event, make_aggregate, member_identity, member_message,
     render_members,
 )
-from .aggregation_states import CloseReason, ContextEvent, ContextKind, ContextState, needs_delivered_predecessor
-from .outbound import IllegalAggregationTransitionError, QueueRequest, check_context_transition
+from .aggregation_states import CloseReason, ContextKind, ContextState, needs_delivered_predecessor
+from .outbound import IllegalAggregationTransitionError, QueueRequest, check_receipt
 from .queued_log import decode_aggregation, encode_aggregation
 from .utils import removal_edit
 
@@ -360,7 +360,7 @@ class LiveTextAggregation:
                                old_message_id=tuple(int(value) for value in log.master_msg_id.rsplit(".", 1)),
                                message=message)
                 return self.queue.materialize_aggregation(row.id, operation, kwargs, encode_aggregation(context), selection)
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "materialize",
                                                     "A removal edit requires its confirmed standalone message.")
         if independent and not context.get("frozen"):
             member = context["member"]
@@ -396,7 +396,7 @@ class LiveTextAggregation:
                 resolved = self.manager.channel.db.resolve_source_member(*member_identity(member), str(context["key"][1]), context["key"][2])
                 if not resolved or not resolved[0].aggregate:
                     raise IllegalAggregationTransitionError(
-                        row.id, context["kind"], ContextEvent.MATERIALIZE,
+                        row.id, context["kind"], "materialize",
                         "Deferred source update requires its confirmed container.")
                 context["container_id"] = resolved[0].master_msg_id
             log = self.manager.channel.db.get_msg_log(master_msg_id=context["container_id"])
@@ -408,7 +408,7 @@ class LiveTextAggregation:
                     children[index] = apply_member_event(previous, MemberEvent.RECEIPT, update).member
             if not self.fits(children, updating=True, confirmed=log.aggregate):
                 raise IllegalAggregationTransitionError(
-                    row.id, context["kind"], ContextEvent.MATERIALIZE,
+                    row.id, context["kind"], "materialize",
                     "Source changes require independent output before container update.")
             base = dict(message_id=int(log.master_msg_id.rsplit(".", 1)[1]), owner=log.sender_bot_id,
                         aggregate=log.aggregate)
@@ -422,7 +422,7 @@ class LiveTextAggregation:
                     and (context["kind"] == ContextKind.MEMBER_UPDATE
                          or self.fits(base["aggregate"]["children"] + members, confirmed=base["aggregate"])))
         if context["kind"] == ContextKind.MEMBER_UPDATE and not can_edit:
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.MATERIALIZE,
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "materialize",
                                                     "Existing aggregate updates require the original owner.")
         if children is None:
             children = base["aggregate"]["children"] + members if can_edit else members
@@ -458,9 +458,9 @@ class LiveTextAggregation:
         context = decode_aggregation(row.log_context)
         if context is None:
             return False
-        state = check_context_transition(row.id, context, ContextEvent.RECEIPT)
+        state = check_receipt(row.id, context)
         if state is ContextState.BOUNDARY:
-            raise IllegalAggregationTransitionError(row.id, context["kind"], ContextEvent.RECEIPT,
+            raise IllegalAggregationTransitionError(row.id, context["kind"], "receipt",
                                                     "A boundary row is reconciled through its own MsgLog context.")
         if context["kind"] in {ContextKind.SOURCE, ContextKind.REDIRECT}:
             return self._reconcile_source(row, receipt, sender_bot_id, context, file_bot_id)

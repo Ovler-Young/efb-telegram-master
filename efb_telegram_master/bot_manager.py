@@ -34,7 +34,7 @@ from telegram.ext import _applicationbuilder as ptb_applicationbuilder
 from telegram.request import HTTPXRequest
 
 from .auxiliary_bot import AuxiliaryBot
-from .aggregation_states import ContextEvent, ContextState, context_state
+from .aggregation_states import ContextKind
 from .bot_pool import BotPool
 from .custom_emoji import AuthorEmojiHeader, strip_custom_emoji_tag
 from .delivery_states import OPERATOR_HOLD, Event, classify, next_state
@@ -56,7 +56,6 @@ from .outbound import (
     IllegalAggregationTransitionError,
     QueueEnqueueError,
     QueuePersistenceError,
-    check_context_transition,
     InvalidTelegramResponseError,
     QueueRequest,
     RequiredSenderUnavailableError,
@@ -1650,9 +1649,8 @@ class TelegramBotManager(LocaleMixin):
     def execute_queued_call(self, row, args: tuple, kwargs: dict, selection: SenderSelection) -> object:
         from .queued_log import decode_aggregation
         aggregation_context = decode_aggregation(row.log_context) if row.log_context else None
-        if aggregation_context:
-            check_context_transition(row.id, aggregation_context, ContextEvent.EXECUTE,
-                                     reason="Aggregation must be materialized before Telegram execution.")
+        if aggregation_context and aggregation_context["kind"] in {ContextKind.LOGICAL, ContextKind.MEMBER_UPDATE}:
+            raise QueuePersistenceError("Aggregation must be materialized before Telegram execution.")
         sender = cast(SyncBotProtocol, selection.sender)
         method = getattr(sender, row.operation)
         telegram_kwargs = cast(dict, OutboundQueue.streaming_uploads(self._strip_private_queue_metadata(kwargs)))
@@ -1886,7 +1884,7 @@ class TelegramBotManager(LocaleMixin):
         try:
             from .queued_log import decode_aggregation
             context = decode_aggregation(row.log_context)
-            if context is not None and context_state(context) is not ContextState.BOUNDARY:
+            if context is not None and context["kind"] != ContextKind.BOUNDARY:
                 real_tg_msg, sender_bot_id, file_bot_id = self._decode_queued_completion_receipt(row.completion_receipt)
                 return self.live_aggregation.reconcile(row, real_tg_msg, sender_bot_id, file_bot_id)
             legacy_context = context["legacy_context"] if context else row.log_context

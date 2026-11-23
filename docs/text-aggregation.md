@@ -111,14 +111,7 @@ in flight, held, `sent_pending`) are a separate machine, described in
 `docs/delivery-recovery.md`.
 
 The definition lives in `efb_telegram_master/aggregation_states.py`:
-`ContextKind` (the stored spellings), `ContextState`, `ContextEvent`, the table
-`CONTEXT_TRANSITIONS` and `context_state()`. The queue mutators in
-`outbound.py` (`replace_logical_aggregation`, `close_aggregation_destination`,
-`materialize_aggregation`, `handoff_aggregation`, `cancel_logical_aggregation`,
-`cancel_pending_source`, `release_delivery_attempt`, and the batch split in
-`enqueue_many`), `LiveTextAggregation.materialize` and `reconcile`, and
-`TelegramBotManager.execute_queued_call` check it through
-`check_context_transition()` before they write.
+`ContextKind` (the stored spellings), `ContextState` and `context_state()`.
 
 | State | Stored as | Meaning |
 |---|---|---|
@@ -132,8 +125,9 @@ The definition lives in `efb_telegram_master/aggregation_states.py`:
 | `boundary` | `kind='boundary'` | An ordinary request (media, commands, a full-content attachment) ordered between batches. It is logged through its own `legacy_context`. |
 | `cancellation` | `kind='cancellation'` in `source_cancellations` | A withdrawn unpublished member, kept so a later edit is not published. Nothing removes it: one small record per withdrawn source stays for the life of the queue file. |
 
-The events and the states each may lead to are in `CONTEXT_TRANSITIONS` in
-`efb_telegram_master/aggregation_states.py`.
+A row takes a Telegram receipt only when it is an aggregate, a frozen output,
+already handed off or a boundary; `check_receipt()` in `outbound.py` refuses any
+other.
 
 A row is created as `logical`, `member_update`, `source`, `frozen_source` (a
 removal edit of a confirmed standalone message) or `boundary`. Updating the
@@ -152,7 +146,7 @@ The check raises `IllegalAggregationTransitionError` and writes nothing. Its
 message names the row, its kind and the event, for example
 `Aggregation queue row 12 of kind 'member_update' does not accept materialize; the row was left unchanged. Deferred source update requires its confirmed container.`
 
-* **At the first attempt or the Telegram call** (`materialize`, `execute`), the
+* **At the first attempt** (`materialize`), the
   outbound worker stops, as for any queue persistence error, and stops again
   after a restart. Find the row with
   `python3 -m efb_telegram_master.queue_report --data-dir <channel data directory>`
@@ -167,11 +161,6 @@ message names the row, its kind and the event, for example
 * **At receipt reconciliation**, the scheduler logs once per row
   `Receipt of queue row 12 (aggregation kind 'logical') cannot be reconciled; it stays queued and is retried: ...`
   and keeps retrying on the usual backoff. Other rows continue.
-* **For a merge, a withdrawal of a pending output or a release**, the row is
-  left as it is and a WARNING says why (`Aggregation batch not replaced: ...`,
-  `Pending source not withdrawn: ...`, `Send attempt not released: ...`). A
-  refused merge or withdrawal is handled like a row that was already sent: the
-  change goes into a new row.
 
 ## Live streams
 
