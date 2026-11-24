@@ -528,6 +528,39 @@ def test_edits_that_no_longer_fit_their_combined_message_are_held_and_sending_go
         restart(manager, make_queue=make_queue)
 
 
+@pytest.mark.parametrize("new_message_arrives", ["after the edit is confirmed", "while the edit is queued",
+                                                 "after the first send is confirmed"])
+def test_an_edit_made_during_the_first_send_survives_the_next_new_message(runtime, new_message_arrives):
+    manager = runtime
+    manager.TRANSPORT_RETRY_SECONDS = 0
+    handler = processor(manager)
+    append(manager, "one", 1, "first")
+    append(manager, "two", 1.1, "second")
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    for submitted in tuple(scheduler.in_flight.values()):
+        submitted.future.result(timeout=2)
+    edit(handler, "one", "edited one")
+    if new_message_arrives == "after the first send is confirmed":
+        scheduler.harvest_completed()
+    if new_message_arrives != "after the edit is confirmed":
+        append(manager, "three", 2, "third")
+    scheduler.harvest_completed()
+    run(manager, passes=6)
+    if new_message_arrives == "after the edit is confirmed":
+        append(manager, "three", 2, "third")
+        run(manager, passes=4)
+    children = lambda: [(child["source_id"], child["source_revision"]) for child in MsgLog.get().aggregate["children"]]
+    assert all(word in manager.transport.messages[1].text for word in ("edited one", "second", "third"))
+    assert children() == [("one", 2), ("two", 1), ("three", 1)]
+    assert MsgLog.get().aggregate["revision"] == 3
+    edit(handler, "two", "short two")
+    run(manager, passes=4)
+    assert all(word in manager.transport.messages[1].text for word in ("edited one", "short two", "third"))
+    assert children() == [("one", 2), ("two", 2), ("three", 1)]
+    assert MsgLog.select().count() == 1
+
+
 def test_new_messages_appended_by_an_unanswered_edit_stay_held(runtime):
     """The edit is the only copy of the appended messages, so it is held like a send."""
     manager = runtime
