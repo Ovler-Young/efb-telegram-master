@@ -184,6 +184,54 @@ def test_in_flight_arrival_receipt_failure_and_restart(runtime, monkeypatch, mak
     assert MsgLog.select().count() == 2
 
 
+@pytest.mark.parametrize("interrupted", ["send", "edit"])
+def test_restart_interrupting_a_combined_message_does_not_keep_its_continuation_waiting(
+        runtime, make_queue, interrupted):
+    manager = runtime
+    append(manager, "one", 1)
+    if interrupted == "edit":
+        complete(manager)
+        append(manager, "two", 5)
+    scheduler = manager._outbound_scheduler
+    scheduler.dispatch_once()
+    row_id, submitted = next(iter(scheduler.in_flight.items()))
+    submitted.future.result(timeout=2)  # Telegram applied it, but the answer is never read.
+    queue_path = manager._outbound_queue.path.parent
+    manager._outbound_queue.close()
+    manager._outbound_queue = make_queue(queue_path)
+    manager._outbound_scheduler = OutboundQueueScheduler(manager._outbound_queue, manager, scheduler.executor, 1)
+    manager.live_aggregation = LiveTextAggregation(manager)
+    append(manager, "three", 6)
+
+    real_edit = manager.transport.edit_message_text
+
+    def edit_already_applied(text, chat_id, message_id, **kwargs):
+        manager.transport.edit_message_text = real_edit
+        manager.transport.calls.append(("edit_message_text", chat_id, text, {"message_id": message_id}))
+        raise BadRequest("Message is not modified: specified new message content and reply markup "
+                         "are exactly the same")
+
+    manager.transport.edit_message_text = edit_already_applied
+    scheduler = manager._outbound_scheduler
+    for _ in range(6):
+        scheduler.dispatch_once()
+        for submitted in list(scheduler.in_flight.values()):
+            submitted.future.exception(timeout=2)
+        scheduler.harvest_completed()
+    assert scheduler.failure is None
+    rows = manager._outbound_queue.connection.execute("SELECT id, delivery_hold FROM outbound_queue").fetchall()
+    children = [[child["source_id"] for child in log.aggregate["children"]]
+                for log in MsgLog.select() if log.aggregate]
+    if interrupted == "send":
+        # The interrupted send is never sent again; the continuation goes out as its own message.
+        assert rows == [(row_id, "uncertain:TimedOut/Restart")]
+        assert [call[0] for call in manager.transport.calls] == ["send_message", "send_message"]
+    else:
+        # The interrupted edit is sent again, "not modified" completes it, then the continuation joins.
+        assert rows == []
+        assert children == [["one", "two", "three"]]
+
+
 def test_rolling_count_fixed_deadline_and_topic_boundary_order(runtime):
     manager = runtime
     with patch("efb_telegram_master.outbound.time.time", return_value=100):

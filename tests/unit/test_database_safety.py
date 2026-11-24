@@ -30,7 +30,6 @@ from efb_telegram_master.db import (
 from efb_telegram_master.db_runtime import (
     DataDirectoryLock, connection_scope, current_schema, postgresql_connection, postgresql_database,
 )
-from efb_telegram_master.delivery_states import FAILED_ATTEMPTS_LIMIT, HoldKind
 from efb_telegram_master.outbound import (
     POSTGRESQL_QUEUE_MARKER, OutboundQueue, QueuePersistenceError, QueueRequest, SenderSelection,
 )
@@ -1397,7 +1396,7 @@ def test_postgresql_payload_version_reads_under_the_queue_lock(tmp_path, postgre
         queue.close()
 
 
-def test_postgresql_queue_has_one_owner_and_releases_interrupted_sends(tmp_path, postgres_config, manager_factory):
+def test_postgresql_queue_has_one_owner_and_holds_interrupted_sends(tmp_path, postgres_config, manager_factory):
     manager_factory(tmp_path, postgres_config)
     queue = _postgresql_queue(tmp_path / "first", postgres_config)
     try:
@@ -1411,8 +1410,8 @@ def test_postgresql_queue_has_one_owner_and_releases_interrupted_sends(tmp_path,
     reopened = _postgresql_queue(tmp_path / "second", postgres_config)
     try:
         assert reopened.connection.execute(
-            "SELECT delivery_hold, reconcile_attempts FROM outbound_queue WHERE id = ?", (row_id,)
-        ).fetchone() == (HoldKind.IN_FLIGHT.value, FAILED_ATTEMPTS_LIMIT)
+            "SELECT delivery_hold FROM outbound_queue WHERE id = ?", (row_id,)
+        ).fetchone() == ("uncertain:TimedOut/Restart",)
     finally:
         reopened.close()
 
@@ -1680,7 +1679,7 @@ def test_moved_queue_loads_and_progresses_exactly_as_its_sqlite_copy(
     assert rows["blocking"] in initial["ready heads"]  # A blocking row goes ahead of its lane.
     assert rows["behind waiting"] not in initial["ready heads"]
     states = {row_id: (state, attempts) for row_id, state, attempts in initial["states"]}
-    assert states[rows["in flight"]] == ("in_flight", FAILED_ATTEMPTS_LIMIT)
+    assert states[rows["in flight"]] == ("uncertain", 0)  # Opening held the interrupted send.
     assert states[rows["sent pending"]][0] == "sent_pending"
     assert len({state for state, _ in states.values()}) >= 6
     assert ("legacy media", b"legacy inline media") in on_postgresql

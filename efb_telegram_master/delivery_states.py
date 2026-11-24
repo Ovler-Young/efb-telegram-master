@@ -21,8 +21,7 @@ SENT_PENDING = "sent_pending"
 
 # ``reconcile_attempts`` of a queued row counts its failed attempts in a row
 # (Telegram flood waits excluded). From this many on, the row no longer defers
-# the rows ordered after it: it keeps retrying and is delivered late. A send
-# interrupted by a restart is raised to this count when the queue opens.
+# the rows ordered after it: it keeps retrying and is delivered late.
 FAILED_ATTEMPTS_LIMIT = 3
 
 
