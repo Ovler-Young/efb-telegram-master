@@ -1678,7 +1678,7 @@ def test_shutdown_waits_for_preparation_and_rejects_publication_after_close(tmp_
 
 def test_constructor_failure_releases_queue_ownership(tmp_path, monkeypatch, make_queue):
     with monkeypatch.context() as patcher:
-        patcher.setattr(OutboundQueue, "_release_interrupted_attempts", Mock(side_effect=RuntimeError("startup failure")))
+        patcher.setattr(OutboundQueue, "_settle_interrupted_attempts", Mock(side_effect=RuntimeError("startup failure")))
         with pytest.raises(RuntimeError, match="startup failure"):
             make_queue(tmp_path)
     queue = make_queue(tmp_path)

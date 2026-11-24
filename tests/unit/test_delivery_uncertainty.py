@@ -155,7 +155,7 @@ def test_crash_after_remote_acceptance_before_harvest_does_not_resend(tmp_path, 
         manager._outbound_scheduler.dispatch_once()
         manager._outbound_scheduler.harvest_completed()
     assert sender.call_count == 1
-    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0] == "in_flight"
+    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)).fetchone()[0] == "uncertain:TimedOut/Restart"
     assert manager.confirm_queued_delivery(row_id, delivered_message())
     assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
     queue.close()
@@ -287,7 +287,10 @@ def test_flood_waits_do_not_count_as_failed_attempts(tmp_path, monkeypatch, make
         queue.close()
 
 
-def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confirmable(tmp_path, caplog, make_queue):
+@pytest.mark.parametrize("attempts_left", [0, 3])
+def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confirmable(
+    tmp_path, caplog, make_queue, attempts_left,
+):
     queue = make_queue(tmp_path)
     row_id, _ = queue.enqueue_many([QueueRequest("send_document", (42, b"archive bytes"), {})], lambda _: document)
     _later_message(queue, row_id)
@@ -295,11 +298,15 @@ def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confir
     manager = setup_manager(queue)
     manager._bot = SimpleNamespace(send_document=sender)
     manager._outbound_scheduler.dispatch_once()
+    # An older build left an interrupted send with its attempts already counted.
+    with queue.connection:
+        queue.connection.execute(
+            "UPDATE outbound_queue SET reconcile_attempts=? WHERE id=?", (attempts_left, row_id))
     # Restart before the response was harvested: the outcome of the send is unknown.
     queue.close()
     with caplog.at_level(logging.WARNING, logger="efb_telegram_master.outbound"):
         queue = make_queue(tmp_path)
-    assert f"Queue row {row_id} for chat 42 was interrupted by a restart" in caplog.text
+    assert f"Queue row {row_id} for chat 42 (send_document) was interrupted by a restart" in caplog.text
     manager = setup_manager(queue)
     later_sender = Mock(return_value=delivered_message())
     manager._bot = SimpleNamespace(send_document=sender, send_message=later_sender)
@@ -309,7 +316,7 @@ def test_a_send_interrupted_by_a_restart_lets_later_messages_go_and_stays_confir
             manager._outbound_scheduler.harvest_completed()
         assert sender.call_count == 1 and later_sender.call_count == 1
         assert queue.connection.execute(
-            "SELECT id, delivery_hold FROM outbound_queue").fetchall() == [(row_id, "in_flight")]
+            "SELECT id, delivery_hold FROM outbound_queue").fetchall() == [(row_id, "uncertain:TimedOut/Restart")]
         assert manager.confirm_queued_delivery(row_id, delivered_message())
         assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
     finally:
@@ -773,7 +780,7 @@ def test_long_edit_attachment_retries_presend_failure_and_holds_interrupted_send
     manager._bot = SimpleNamespace(edit_message_text=primary, send_document=supplement)
     manager._outbound_scheduler.dispatch_once()
     assert primary.call_count == 1 and supplement.call_count == 2
-    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue").fetchone() == ("in_flight",)
+    assert queue.connection.execute("SELECT delivery_hold FROM outbound_queue").fetchone() == ("uncertain:TimedOut/Restart",)
     assert list(queue.media_dir.iterdir())
     queue.close()
 
@@ -868,13 +875,22 @@ def test_confirming_primary_after_crash_preserves_pending_attachment(tmp_path, o
     manager = setup_manager(queue)
     manager._bot = sender
     manager._outbound_scheduler.dispatch_once()
+    if operation == "edit_message_text":
+        # An interrupted edit is sent again; its attachment follows the answer.
+        for _ in range(3):
+            manager._outbound_scheduler.dispatch_once()
+            manager._outbound_scheduler.harvest_completed()
+        assert primary.call_count == 2 and attachments == [b"x" * 5000]
+        assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
+        queue.close()
+        return
     assert primary.call_count == 1 and not attachments
     assert manager.confirm_queued_delivery(row_id, delivered_message())
     assert primary.call_count == 1 and not attachments
     manager._outbound_scheduler.dispatch_once()
     manager._outbound_scheduler.harvest_completed()
     assert primary.call_count == 1
-    assert attachments == [b"x" * (2048 if operation == "send_document" else 5000)]
+    assert attachments == [b"x" * 2048]
     assert not queue.connection.execute("SELECT id FROM outbound_queue").fetchall()
     assert not list(queue.media_dir.iterdir())
     queue.close()

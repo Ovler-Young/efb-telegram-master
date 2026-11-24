@@ -4,14 +4,14 @@ A timeout or disconnected HTTP response is not proof that Telegram rejected a
 message. The remote side may have accepted it. Message-creating queue operations
 and text/caption edits persist `delivery_hold='in_flight'` before executor
 submission. The hold is cleared only for a definite rejection/pre-send connection
-failure, or by saving an actual completion receipt. An interrupted attempt stays
-held across restarts. An ambiguous failure of a send is stored as
-`uncertain:<exception-class>/<cause-class>`. Whenever a row is held after a
-Telegram error (uncertain or rejected), the error's text is kept next to the hold
-in `hold_reason`, cut to 200 characters: Telegram's description for a rejection,
-such as `Chat not found`, or the transport's, such as `Timed out`. Other
-exceptions leave it empty. No message contents, request objects, tokens or exception
-tracebacks are stored in either column.
+failure, or by saving an actual completion receipt. An attempt a restart
+interrupted is settled when the queue opens (see below). An ambiguous failure of
+a send is stored as `uncertain:<exception-class>/<cause-class>`. Whenever a row
+is held after a Telegram error (uncertain or rejected), the error's text is kept
+next to the hold in `hold_reason`, cut to 200 characters: Telegram's description
+for a rejection, such as `Chat not found`, or the transport's, such as
+`Timed out`. Other exceptions leave it empty. No message contents, request
+objects, tokens or exception tracebacks are stored in either column.
 
 Held rows keep their payload, sidecar and original MsgLog context. They are not
 silently marked sent and are not deleted. Other runnable rows, including newer
@@ -41,8 +41,8 @@ aggregated container does not count as a newer edit. It is built from the
 confirmed container and does not carry this edit's content, so the older edit
 gets its second try first. The log shows `Telegram did not confirm the edit ...
 trying it once more` or `... dropped because ...`. A blocking caller of a dropped
-edit gets the transport error. An edit interrupted by a restart stays
-`in_flight`, like a send.
+edit gets the transport error. An edit interrupted by a restart is
+sent again when the queue opens (see below).
 
 This is not an exactly-once transport guarantee: after loss of the response,
 remote success requires evidence. No increasing retry count, arbitrary file-size
@@ -218,8 +218,8 @@ Stored spellings never change between versions.
 |---|---|---|---|
 | waiting | `queued` / NULL | Will be sent when its destination's turn comes. | None. |
 | deferred | `queued` / NULL, `reconcile_after` ahead | Media acquisition failed before any send, or a send kept failing with a retryable error (a connection that never reached Telegram, a chat migration) for 3 attempts; retried after a backoff. Earlier failed sends are retried after a backoff the scheduler keeps in memory, and the row stays waiting. | None. |
-| in_flight | `queued` / `in_flight` | Attempt recorded before submission. After a restart it is an interrupted attempt that may have been delivered; opening the queue counts it as 3 failed attempts, so later rows no longer wait for it. | If delivered, `/confirm_send`; otherwise investigate. |
-| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result of a send: Telegram may have accepted it. An edit is retried once or dropped instead, unless it appends new messages (see the top of this guide). | `/confirm_send` on the delivered message. |
+| in_flight | `queued` / `in_flight` | Attempt recorded before submission. Only a send in progress is in this state: opening the queue settles any row a restart left here, a send into `uncertain:TimedOut/Restart` and an edit back to waiting. | None while the bot runs. |
+| uncertain | `queued` / `uncertain:<Class>[/<Cause>]` | Ambiguous result of a send: Telegram may have accepted it. `uncertain:TimedOut/Restart` is a send a restart interrupted. An edit is retried once or dropped instead, unless it appends new messages (see the top of this guide). | `/confirm_send` on the delivered message. |
 | uncertain (operator) | `queued` / `uncertain:operator_observed_delivery` | Held offline by `hold_send` for a send already seen on Telegram. | `/confirm_send`; any configured bot is accepted. |
 | invalid_payload | `queued` / `invalid_payload` | The stored request cannot be decoded. Not evidence of delivery. | Investigate the row. |
 | history_failed | `queued` / `history_failed:<Class>` | History replay was rejected. Startup re-queues `RequiredSenderUnavailableError` rows that never started an attempt. | Investigate, or `/confirm_send` if it was delivered. |
@@ -329,13 +329,15 @@ An event the row's state does not accept is never applied. The queue raises
 invalid_payload; hold_uncertain is not allowed there, so the row was left
 unchanged.` It is handled like any other queue persistence error, and the row
 keeps its bytes. In particular a hold never replaces another hold, and an
-acquisition retry never clears one. Raising the failed-attempt count of an
-interrupted `in_flight` row when the queue opens changes no state and is not an
-event. Three events are reported instead of stopping: releasing a row that is
-not in flight logs `Send attempt not released: ...`, counting a failed send on
-a row that is not waiting logs `Failed send not counted: ...`, and deferring
-the reconciliation of a row that is not `sent_pending` logs `... its receipt
-reconciliation was not deferred.`
+acquisition retry never clears one. Settling an interrupted `in_flight` row when
+the queue opens writes the row straight to the state `hold_uncertain` (a send)
+or `release_attempt` (an edit) would leave it in, uncertain or waiting; it is
+not an event, and it leaves the row's payload and sender as stored. Three events
+are reported instead of stopping: releasing a row that is not in flight logs
+`Send attempt not released: ...`, counting a failed send on a row that is not
+waiting logs `Failed send not counted: ...`, and deferring the reconciliation of
+a row that is not `sent_pending` logs `... its receipt reconciliation was not
+deferred.`
 `/confirm_send` answers `Only a held, unconfirmed send can be confirmed.` for a
 row it cannot resolve, `This batch was never sent to Telegram as one message, so
 no reply can confirm it. It stays held and no data was changed.` for an unsent
@@ -353,8 +355,8 @@ dependent's side a link is:
   `sent_pending`, or is waiting, deferred or in flight with fewer than 3 failed
   attempts in a row. The dependent waits.
 * **failing**: the predecessor is waiting, deferred or in flight after 3 failed
-  attempts in a row, or after a restart interrupted its send. The dependent is
-  ready unless it needs the predecessor's Telegram message (below).
+  attempts in a row. The dependent is ready unless it needs the predecessor's
+  Telegram message (below).
 * **void**: the predecessor is gone, is the row itself, or is held. The
   dependent is ready: waiting for it either already happened or never ends.
 * **cycle**: every waiting row defers to another waiting row that has not
@@ -375,11 +377,19 @@ destination's head, so later rows of the same chat are sent. Once the deadline
 passes, the row is the oldest again and is retried. If it succeeds it appears in
 the chat after the messages that overtook it; nothing is dropped.
 
-An attempt interrupted by a restart stays `in_flight` and is never sent again
-by itself. Opening the queue raises its count to 3 and logs `Queue row N for
-chat C was interrupted by a restart while sending; counted as 3 failed
-attempts, later rows no longer wait for it. It stays held for /confirm_send.`
-`/confirm_send` resolves it as before.
+Opening the queue settles every attempt a restart or a host reboot left in
+flight, whichever build left it, so the rows after it are not kept waiting.
+A send is held as `uncertain:TimedOut/Restart` and is never sent again by
+itself; `/confirm_send` resolves it as for a send whose answer was lost. This
+is the one hold whose second part is not an exception class: it names the
+cause, and its first part keeps the held send handled like a timed-out one by
+`/confirm_send` and the clearing tool. An edit is released as stored and sent
+again, also an edit that appends messages to an aggregated container: it goes
+out unchanged by the bot that owns the container, and if Telegram had already
+applied it, "message is not modified" counts as delivered. A second lost answer
+on it holds it or drops it as described at the top of this guide. Each row logs
+`Queue row N for chat C (operation) was interrupted by a restart while
+sending; ...`, saying whether it was held or its edit is sent again.
 
 Some dependents of a failing row need its Telegram message, not only its turn:
 an edit of a container (`member_update`, including a removal or routing hint),

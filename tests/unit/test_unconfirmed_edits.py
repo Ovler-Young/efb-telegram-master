@@ -123,6 +123,36 @@ def test_an_unconfirmed_try_is_remembered_across_a_restart(tmp_path, make_queue)
     queue.close()
 
 
+def test_an_edit_interrupted_by_a_restart_is_sent_again_and_completes_when_already_applied(tmp_path, make_queue):
+    queue = make_queue(tmp_path)
+    row_id, _ = _edit(queue, "new text")
+    manager = setup_manager(queue)
+    first = []
+    manager._bot = SimpleNamespace(edit_message_text=lambda *args, **kwargs: first.append(kwargs) or edited("new text"))
+    manager._outbound_scheduler.dispatch_once()  # Sent, but the restart came before the answer was harvested.
+    assert len(first) == 1
+    queue.close()
+    queue = make_queue(tmp_path)
+    try:
+        hold, attempts, unconfirmed = queue.connection.execute(
+            "SELECT delivery_hold, reconcile_attempts, unconfirmed_at FROM outbound_queue WHERE id=?", (row_id,)
+        ).fetchone()
+        assert hold is None and attempts == 0 and unconfirmed is not None
+        manager = setup_manager(queue)
+        second = []
+
+        def not_modified(*args, **kwargs):
+            second.append(kwargs)
+            raise BadRequest("Bad Request: message is not modified")
+
+        manager._bot = SimpleNamespace(edit_message_text=not_modified)
+        _run(manager)
+        assert [kwargs["text"] for kwargs in second] == ["new text"]
+        assert _row(queue, row_id) is None
+    finally:
+        queue.close()
+
+
 def test_a_timed_out_edit_that_goes_through_on_its_second_try_completes(tmp_path, make_queue):
     queue = make_queue(tmp_path)
     row_id, waiter = _edit(queue, "new text")

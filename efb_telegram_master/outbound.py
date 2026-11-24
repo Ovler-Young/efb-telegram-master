@@ -1025,7 +1025,7 @@ class OutboundQueue:
                 "completion_receipt BLOB NULL)"
             )
             self._migrate_schema(connection)
-            self._release_interrupted_attempts(connection)
+            self._settle_interrupted_attempts(connection)
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS history_ownership (entry_key TEXT PRIMARY KEY)"
             )
@@ -1076,7 +1076,7 @@ class OutboundQueue:
                 raise QueuePersistenceError("Outbound queue is already in use by another owner.")
             with connection:
                 self._repair_history_sender_holds(connection)
-                self._release_interrupted_attempts(connection)
+                self._settle_interrupted_attempts(connection)
         except BaseException:
             connection.close()
             raise
@@ -1167,30 +1167,35 @@ class OutboundQueue:
         )
 
     @staticmethod
-    def _release_interrupted_attempts(connection: _QueueConnection) -> None:
-        """A send left in flight by a restart stops deferring the rows after it.
+    def _settle_interrupted_attempts(connection: _QueueConnection) -> None:
+        """Settle every attempt a restart left in flight, whoever left it.
 
-        Nothing is in flight while the queue opens, so the outcome of such a send
-        is unknown and it is never replayed. It keeps its hold for /confirm_send;
-        counting it as failed often enough lets later rows go out meanwhile.
+        Nothing is in flight while the queue opens. A send's outcome is unknown, so
+        it is held like a send whose answer was lost and is never sent again by the
+        bot; a held row does not keep the rows after it waiting. An edit is sent
+        again as stored: if it already applied, Telegram answers "message is not
+        modified", which counts as delivered.
         """
         interrupted = connection.execute(
-            "SELECT id, telegram_chat_id FROM outbound_queue "
-            "WHERE delivery_state=? AND delivery_hold=? AND reconcile_attempts < ? ORDER BY id",
-            (QUEUED, HoldKind.IN_FLIGHT.value, FAILED_ATTEMPTS_LIMIT),
+            "SELECT id, telegram_chat_id, operation FROM outbound_queue "
+            "WHERE delivery_state=? AND delivery_hold=? ORDER BY id", (QUEUED, HoldKind.IN_FLIGHT.value),
         ).fetchall()
-        if not interrupted:
-            return
-        connection.execute(
-            "UPDATE outbound_queue SET reconcile_attempts=? "
-            "WHERE delivery_state=? AND delivery_hold=? AND reconcile_attempts < ?",
-            (FAILED_ATTEMPTS_LIMIT, QUEUED, HoldKind.IN_FLIGHT.value, FAILED_ATTEMPTS_LIMIT),
-        )
-        for row_id, chat_id in interrupted:
+        for row_id, chat_id, operation in interrupted:
+            if operation in EDIT_OPERATIONS:
+                connection.execute(
+                    "UPDATE outbound_queue SET delivery_hold=NULL, reconcile_attempts=0, reconcile_after=0, "
+                    "unconfirmed_at=COALESCE(unconfirmed_at, ?) WHERE id=?", (time.time(), row_id),
+                )
+                outcome = "its edit is sent again"
+            else:
+                connection.execute(
+                    "UPDATE outbound_queue SET delivery_hold=? WHERE id=?",
+                    (format_hold(HoldKind.UNCERTAIN, "TimedOut/Restart"), row_id),
+                )
+                outcome = "it is held for /confirm_send as a send whose answer was lost"
             logging.getLogger(__name__).warning(
-                "Queue row %s for chat %s was interrupted by a restart while sending; counted as "
-                "%d failed attempts, later rows no longer wait for it. It stays held for /confirm_send.",
-                row_id, chat_id, FAILED_ATTEMPTS_LIMIT,
+                "Queue row %s for chat %s (%s) was interrupted by a restart while sending; %s.",
+                row_id, chat_id, operation, outcome,
             )
 
     @property
