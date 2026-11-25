@@ -415,6 +415,11 @@ class LiveTextAggregation:
             members = []
         else:
             base = context.get("base")
+            if base:
+                # An update confirmed after this batch was queued is the state to build on.
+                log = self.manager.channel.db.get_msg_log(master_msg_id=f"{context['key'][1]}.{base['message_id']}")
+                if log and log.aggregate and log.aggregate["revision"] > base["aggregate"]["revision"]:
+                    base = dict(base, aggregate=log.aggregate)
             members = context["members"]
             children = None
         owner = base and base["owner"]
