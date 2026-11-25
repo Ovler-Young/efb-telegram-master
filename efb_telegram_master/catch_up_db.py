@@ -189,7 +189,7 @@ def _catch_up_target(db, directory: Path, base_path: Path, source_path: Path, fi
                     db.execute_sql("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
                     manifest = _read_import(db)
                     if manifest is None:
-                        raise RuntimeError("PostgreSQL has no import record; import tgdata.db first, without --catch-up.")
+                        raise RuntimeError("PostgreSQL has no import record; import tgdata.db first with migrate_db.")
                     models = MODELS + _cache_models(source, manifest)
                     _validate_source(source, models)
                     _validate_source(base, MODELS + _cache_models(base, manifest))
