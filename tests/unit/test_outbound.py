@@ -4,8 +4,8 @@ import logging
 import os
 import pickle
 from pathlib import Path
-import sqlite3
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1247,8 +1247,8 @@ def test_bot_stops_itself_when_the_send_worker_stops_for_good(tmp_path, monkeypa
     kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
     reopened = make_queue(tmp_path)
     assert reopened.connection.execute(
-        "SELECT id FROM outbound_queue WHERE id=?", (row_id,)
-    ).fetchone() is not None
+        "SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone()[0] == "uncertain:TimedOut/Restart"
 
 
 def test_bot_keeps_running_when_the_send_worker_is_asked_to_stop(tmp_path, monkeypatch, make_queue):

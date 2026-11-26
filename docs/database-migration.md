@@ -126,8 +126,10 @@ fail and the outbound worker stops sending: it logs `Outbound recovery stopped; 
 rows retained`, and ETM then stops itself in the same way as `systemctl stop`, so that
 the service manager can start it again with the queue reopened. The service must
 therefore restart ETM after a clean exit (`Restart=always`, not `Restart=on-failure`)
-and wait before it does (`RestartSec=30`, so a database that is still starting is
-retried). Nothing queued is lost. Rows stay in PostgreSQL and the next start handles
+and wait before it does (for example `RestartSec=30`, or a delay in `ExecStopPost`), so
+a database that is still starting is retried. With `Restart=always`, a stop cause that
+does not clear repeats the stop and start every few minutes until someone looks at the
+log. Nothing queued is lost. Rows stay in PostgreSQL and the next start handles
 them by the usual start rules: a send that was in flight stays held for
 `/confirm_send`. Messages that arrive from the other side while ETM is down or
 restarting are lost. Avoid automatic restarts or image updates of the database
