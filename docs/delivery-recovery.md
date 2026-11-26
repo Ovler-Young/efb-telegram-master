@@ -439,7 +439,7 @@ first one in this table wins.
 
 | Pass ends as | When | Worker then waits | Log |
 |---|---|---|---|
-| stopped | The scheduler is stopping or hit a queue persistence error. | Does not wait: the worker exits and durable rows stay queued. | `Outbound recovery stopped; durable rows retained: ...` after a persistence error |
+| stopped | The scheduler is stopping or hit a queue persistence error. | Does not wait: the worker exits and durable rows stay queued. After a persistence error ETM then stops itself, and the service manager must start it again (`Restart=always`, with a `RestartSec`). | `Outbound recovery stopped; durable rows retained: ...` after a persistence error |
 | stalled | Rows are still waiting, none has a retry deadline, nothing is in flight. | 30 seconds (`STALL_RESCAN_SECONDS`), then rescans. | `Outbound scheduler left N dispatchable head(s) undispatched ... while queued rows remain`, at most once a minute |
 | cycle | No head was ready and every waiting row defers to another waiting row that is not failing; the oldest row per destination was sent anyway. | For that call to complete, or for a retry deadline. The next pass re-elects every head. | `deferred by predecessor links that never resolve` |
 | permit_leak | Every worker slot was taken while nothing was in flight, so no completion could free one; the slots were reset. | For the calls this pass started, or for a retry deadline. | `Outbound worker permits were held without a submitted call; resetting them. Queued rows are retained.` |
