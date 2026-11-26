@@ -445,7 +445,7 @@ first one in this table wins.
 | permit_leak | Every worker slot was taken while nothing was in flight, so no completion could free one; the slots were reset. | For the calls this pass started, or for a retry deadline. | `Outbound worker permits were held without a submitted call; resetting them. Queued rows are retained.` |
 | busy | A call is in flight. | For a completion, or for a retry deadline. | None. |
 | deferred | Nothing is in flight; a row, receipt or blocked media edit has a retry deadline. | Until the earliest deadline. | None. |
-| idle | Nothing is waiting and nothing is in flight. | For the next enqueue, with no timeout. | None. |
+| idle | Nothing is waiting and nothing is in flight. | For the next enqueue, or 30 seconds (`STALL_RESCAN_SECONDS`) at most, then a pass that finds a database session that died while idle. | None. |
 
 `N` in the stall line counts the heads the pass looked at. It is 0 when every
 waiting row sits behind an ordering link, so `left 0 dispatchable head(s)`
