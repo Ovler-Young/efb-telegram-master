@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 import io
 import logging
+import os
 import pickle
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1210,6 +1212,88 @@ def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch,
         assert queue.connection.execute(
             "SELECT delivery_hold FROM outbound_queue WHERE id=?", (_row_id,)
         ).fetchone()[0] == "in_flight"
+
+
+def _worker_on_real_queue(tmp_path, make_queue, monkeypatch, row=True):
+    """Build the real send worker, scheduler and queue; only the process signal is replaced."""
+    queue = make_queue(tmp_path)
+    row_id = None
+    if row:
+        row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "text"}))
+    manager = bare_manager()
+    manager.logger = Mock()
+    manager._stopping = threading.Event()
+    manager._send_worker_stop = threading.Event()
+    manager._send_executor = ThreadPoolExecutor(max_workers=1)
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = OutboundQueueScheduler(queue, Adapter(), manager._send_executor, worker_count=1)
+    manager._outbound_finalization_lock = threading.Lock()
+    manager._outbound_resources_finalized = False
+    kill = Mock()
+    monkeypatch.setattr("efb_telegram_master.bot_manager.os.kill", kill)
+    return queue, row_id, manager, kill
+
+
+def _database_error(*_args, **_kwargs):
+    raise sqlite3.OperationalError("server closed the connection")
+
+
+def _run_worker_until_it_exits(manager):
+    worker = threading.Thread(target=manager._queued_send_worker)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive()
+
+
+def test_bot_stops_itself_when_the_send_worker_stops_for_good(tmp_path, monkeypatch, make_queue):
+    queue, row_id, manager, kill = _worker_on_real_queue(tmp_path, make_queue, monkeypatch)
+    monkeypatch.setattr(queue, "delete", _database_error)
+
+    _run_worker_until_it_exits(manager)
+
+    kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    reopened = make_queue(tmp_path)
+    assert reopened.connection.execute(
+        "SELECT delivery_hold FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone()[0] == "uncertain:TimedOut/Restart"
+
+
+def test_bot_stops_itself_when_a_database_error_ends_the_send_worker(tmp_path, monkeypatch, make_queue):
+    queue, _row_id, manager, kill = _worker_on_real_queue(tmp_path, make_queue, monkeypatch)
+    monkeypatch.setattr(queue, "heads", _database_error)
+    monkeypatch.setattr(threading, "excepthook", lambda _args: None)
+
+    _run_worker_until_it_exits(manager)
+
+    kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+
+def test_bot_does_not_stop_again_when_the_send_worker_fails_during_a_stop(tmp_path, monkeypatch, make_queue):
+    queue, _row_id, manager, kill = _worker_on_real_queue(tmp_path, make_queue, monkeypatch)
+    manager._stopping.set()
+    monkeypatch.setattr(queue, "delete", _database_error)
+
+    _run_worker_until_it_exits(manager)
+
+    kill.assert_not_called()
+
+
+def test_idle_send_worker_notices_a_database_session_that_died(tmp_path, monkeypatch, make_queue):
+    queue, _row_id, manager, kill = _worker_on_real_queue(tmp_path, make_queue, monkeypatch, row=False)
+    scheduler = manager._outbound_scheduler
+    monkeypatch.setattr(scheduler, "STALL_RESCAN_SECONDS", 0.05)
+    first_pass_done = threading.Event()
+    dispatch_once = scheduler.dispatch_once
+    monkeypatch.setattr(scheduler, "dispatch_once", lambda: (dispatch_once(), first_pass_done.set()))
+    worker = threading.Thread(target=manager._queued_send_worker)
+    worker.start()
+    assert first_pass_done.wait(10)
+
+    queue._connection.close()
+
+    worker.join(10)
+    assert not worker.is_alive()
+    kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
 
 
 def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch, make_queue):

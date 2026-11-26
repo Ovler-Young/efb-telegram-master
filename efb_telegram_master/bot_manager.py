@@ -11,6 +11,7 @@ import numbers
 import os
 import pickle
 import re
+import signal
 import tempfile
 import threading
 import time
@@ -2142,14 +2143,26 @@ class TelegramBotManager(LocaleMixin):
                 self._outbound_scheduler.harvest_completed()
                 self._outbound_scheduler.dispatch_once()
                 deadline = self._outbound_scheduler.next_deadline
-                timeout = None if deadline is None else max(0.01, deadline - time.monotonic())
+                # Bounded when idle, so a database session that died meanwhile is found by the next pass.
+                timeout = self._outbound_scheduler.STALL_RESCAN_SECONDS if deadline is None else max(0.01, deadline - time.monotonic())
                 self._outbound_scheduler.wake_event.wait(timeout=timeout)
+        except Exception as error:
+            self._outbound_scheduler._stop_for_persistence_error(error)
+            raise
         finally:
             if self._outbound_scheduler.failure is not None:
                 self.logger.error("Outbound recovery stopped; durable rows retained: %s", self._outbound_scheduler.failure)
-            self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
+            try:
+                self._outbound_scheduler.stop_and_drain(self.SHUTDOWN_DRAIN_TIMEOUT)
+            except Exception as error:  # noqa: BLE001 - any failure of the drain must still close the queue and stop the bot
+                self._outbound_scheduler._stop_for_persistence_error(error)
             self._finalize_outbound_resources()
             self.logger.debug("Outbound queue worker stopped")
+            if self._outbound_scheduler.failure is not None and not self._stopping.is_set():
+                # Without its queue the bot can only drop what arrives; a normal stop lets
+                # the service manager start it again with the queue reopened.
+                self.logger.critical("Outbound queue stopped for good; stopping the bot so it can be started again.")
+                os.kill(os.getpid(), signal.SIGTERM)
 
     RETRY_AFTER_LOG_INTERVAL = 60.0
 

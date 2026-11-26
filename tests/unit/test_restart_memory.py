@@ -280,7 +280,7 @@ def test_worker_waits_for_events_or_deadline_without_scanning_four_times_per_sec
         stopping=False, failure=None, wake_event=wake,
         next_deadline=None if delay is None else time.monotonic() + delay,
         harvest_completed=Mock(), dispatch_once=Mock(side_effect=wake.set),
-        stop_and_drain=Mock(),
+        stop_and_drain=Mock(), STALL_RESCAN_SECONDS=30.0,
     )
     manager._outbound_scheduler = scheduler
 
@@ -293,7 +293,7 @@ def test_worker_waits_for_events_or_deadline_without_scanning_four_times_per_sec
         manager._queued_send_worker()
     assert len(observed) == 1
     if delay is None:
-        assert observed[0] is None
+        assert observed[0] == 30.0
     else:
         assert observed[0] > 59.0
 
