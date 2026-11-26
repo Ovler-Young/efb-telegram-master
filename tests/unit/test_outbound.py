@@ -1,9 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
 import io
 import logging
+import os
 import pickle
 from pathlib import Path
 import sqlite3
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1210,6 +1212,49 @@ def test_delete_failure_stops_scheduler_and_fails_waiters(tmp_path, monkeypatch,
         assert queue.connection.execute(
             "SELECT delivery_hold FROM outbound_queue WHERE id=?", (_row_id,)
         ).fetchone()[0] == "in_flight"
+
+
+def _run_worker_until_it_exits(tmp_path, make_queue, monkeypatch, fail):
+    """Run the real send worker on its own thread against a real queue; return what it did to the process."""
+    queue = make_queue(tmp_path)
+    row_id, _waiter = enqueue(queue, QueueRequest("send_message", (), {"chat_id": 7, "text": "text"}))
+    manager = bare_manager()
+    manager.logger = Mock()
+    manager._stopping = threading.Event()
+    manager._send_worker_stop = threading.Event()
+    manager._send_executor = ThreadPoolExecutor(max_workers=1)
+    manager._outbound_queue = queue
+    manager._outbound_scheduler = OutboundQueueScheduler(queue, Adapter(), manager._send_executor, worker_count=1)
+    manager._outbound_finalization_lock = threading.Lock()
+    manager._outbound_resources_finalized = False
+    if fail:
+        monkeypatch.setattr(queue, "delete", lambda _row_id: (_ for _ in ()).throw(sqlite3.OperationalError()))
+    kill = Mock()
+    monkeypatch.setattr("efb_telegram_master.bot_manager.os.kill", kill)
+    worker = threading.Thread(target=manager._queued_send_worker)
+    worker.start()
+    if not fail:
+        manager._send_worker_stop.set()
+        manager._outbound_scheduler.wake_event.set()
+    worker.join(10)
+    assert not worker.is_alive()
+    return row_id, kill
+
+
+def test_bot_stops_itself_when_the_send_worker_stops_for_good(tmp_path, monkeypatch, make_queue):
+    row_id, kill = _run_worker_until_it_exits(tmp_path, make_queue, monkeypatch, fail=True)
+
+    kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    reopened = make_queue(tmp_path)
+    assert reopened.connection.execute(
+        "SELECT id FROM outbound_queue WHERE id=?", (row_id,)
+    ).fetchone() is not None
+
+
+def test_bot_keeps_running_when_the_send_worker_is_asked_to_stop(tmp_path, monkeypatch, make_queue):
+    _row_id, kill = _run_worker_until_it_exits(tmp_path, make_queue, monkeypatch, fail=False)
+
+    kill.assert_not_called()
 
 
 def test_failed_limit_acquisition_keeps_row_and_schedules_non_busy_wake(tmp_path, monkeypatch, make_queue):
