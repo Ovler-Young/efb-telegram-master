@@ -11,7 +11,7 @@ import threading
 from contextlib import nullcontext, suppress
 from enum import Enum
 from functools import wraps
-from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, Union
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, Union
 
 from peewee import (
     AutoField,
@@ -197,7 +197,7 @@ class MsgLog(BaseModel):
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
-    def _misc(self) -> PickledDict:
+    def _misc(self) -> dict[str, Any]:
         """Decoded ``pickle``, kept on this row object until ``pickle`` is assigned a new value."""
         raw = self.pickle
         cached = self.__dict__.get("_misc_cache")
