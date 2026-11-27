@@ -2049,3 +2049,30 @@ def test_queue_move_keeps_python_memory_bounded_by_bytes(tmp_path, postgres_conf
     assert record["tables"]["outbound_queue"]["rows"] == 97
     # 96 MiB of payloads would go into one 500-row batch; the byte bound splits it.
     assert peak < 32 * 1024 * 1024
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_aggregate_finalize_inserts_only_new_members_and_saves_only_its_columns(
+        sqlite_source, manager_factory, request, backend):
+    from efb_telegram_master.aggregate import make_aggregate, make_source_member
+    from tests.unit.test_live_aggregate import receipt, source
+
+    postgres = request.getfixturevalue("postgres_config") if backend == "postgresql" else None
+    if postgres:
+        migrate_db.migrate(sqlite_source, postgres)
+    manager = manager_factory(sqlite_source, postgres)
+    one, two = (make_source_member(source(uid, f"text {uid}")) for uid in ("one", "two"))
+
+    def finalize(members, revision):
+        with patch.object(db_module.MsgLogMember, "insert_many", wraps=db_module.MsgLogMember.insert_many) as insert:
+            manager.finalize_aggregate_message(receipt(1), make_aggregate(members, revision), "700")
+        return [[row["slave_message_id"] for row in call.args[0]] for call in insert.call_args_list]
+
+    assert finalize([one], 1) == [["one"]]
+    db_module.MsgLog.update(slave_member_uid="kept").where(db_module.MsgLog.master_msg_id == "-100.1").execute()
+    assert finalize([one, two], 2) == [["two"]]
+    assert finalize([one, two], 3) == []
+    row = manager.get_msg_log(master_msg_id="-100.1")
+    assert row.slave_member_uid == "kept"
+    assert row.aggregate["revision"] == 3
+    assert db_module.MsgLogMember.select().count() == 2

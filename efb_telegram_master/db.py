@@ -1022,6 +1022,7 @@ class DatabaseManager:
             if row and row.sender_bot_id != sender_bot_id:
                 raise ValueError("A live aggregate retains its sending Bot.")
             saved = copy.deepcopy(aggregate)
+            previous_members: Dict[Tuple[str, str], SourceMember] = {}
             if previous:
                 previous_members = {member_identity(member): member for member in previous["children"]}
                 if not set(previous_members).issubset(identities):
@@ -1032,6 +1033,7 @@ class DatabaseManager:
                         # Newer saved routing and removals survive an older receipt snapshot.
                         saved["children"][index] = apply_member_event(old, MemberEvent.RECEIPT, member).member
             first = saved["children"][0]
+            first_insert = row is None
             if row is None:
                 self.add_or_update_message_log(member_message(first), master_message, sender_bot_id=sender_bot_id)
                 row = self._locked_message_log(master_id)
@@ -1041,12 +1043,19 @@ class DatabaseManager:
             misc["aggregate"] = saved
             row.pickle = pickle.dumps(misc, protocol=5)
             row.text = aggregate["confirmed_text"]
+            columns = [MsgLog.pickle, MsgLog.text]
+            if first_insert:
+                columns.append(MsgLog.time)
             topic = getattr(master_message, "message_thread_id", None)
             if topic is not None:
                 row.master_message_thread_id = str(topic)
-            row.save()
-            for member in saved["children"]:
-                self._add_member_mapping(master_id, member)
+                columns.append(MsgLog.master_message_thread_id)
+            row.save(only=columns)
+            new_members = [{"master_msg_id": master_id, "slave_origin_uid": member["origin_uid"],
+                            "slave_message_id": member["source_id"]}
+                           for member in saved["children"] if member_identity(member) not in previous_members]
+            if new_members:
+                MsgLogMember.insert_many(new_members).on_conflict_ignore().execute()
             return row
 
     @observe_database_method("finalize_source_message")
