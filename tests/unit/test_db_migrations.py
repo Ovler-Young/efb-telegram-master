@@ -29,7 +29,6 @@ from efb_telegram_master.db import (
 )
 from efb_telegram_master.db_runtime import connection_scope, current_schema
 from efb_telegram_master.message import ETMMsg
-from tests.unit.test_database_safety import postgres_config, postgres_server_config  # noqa: F401
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID

@@ -552,8 +552,8 @@ class DatabaseManager:
 
         Duplicates are removed first: the oldest row wins for a chat link
         (outbound routing reads it first) and the newest for a topic (inbound
-        routing reads it first). Only the bot's own startup does this, so a
-        database import never sees these indexes.
+        routing reads it first). Only the bot's own startup does this, so the
+        offline import never creates these indexes.
         """
         for model, key, keep, index, columns in (
             (ChatAssoc, (ChatAssoc.slave_uid,), fn.MIN, "chatassoc_slave_unique", "slave_uid"),
