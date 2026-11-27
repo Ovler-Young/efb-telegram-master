@@ -1,6 +1,7 @@
 """Regression checks for query plans, bounded BLOB reads and durable backoff."""
 
 import datetime
+import pickle
 import sqlite3
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
@@ -428,3 +429,18 @@ def test_dispatch_head_scan_is_served_by_a_covering_index(tmp_path):
         assert "COVERING INDEX outbound_queue_ready_heads" in plan, plan
     finally:
         queue.close()
+
+
+def test_message_log_row_decodes_its_pickle_once_until_it_is_replaced(monkeypatch):
+    row = MsgLog(pickle=pickle.dumps({"file_bot_id": "7", "source_member": {"id": 1}}, protocol=5))
+    calls = []
+    real_loads = pickle.loads
+    monkeypatch.setattr(db_module.pickle, "loads", lambda data: calls.append(data) or real_loads(data))
+
+    assert (row.file_bot_id, row.source_member, row.aggregate) == ("7", {"id": 1}, None)
+    assert row.file_bot_id == "7"
+    assert len(calls) == 1
+
+    row.pickle = pickle.dumps({"file_bot_id": "8"}, protocol=5)
+    assert (row.file_bot_id, row.source_member) == ("8", None)
+    assert len(calls) == 2

@@ -197,24 +197,30 @@ class MsgLog(BaseModel):
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
+    def _misc(self) -> PickledDict:
+        """Decoded ``pickle``, kept on this row object until ``pickle`` is assigned a new value."""
+        raw = self.pickle
+        cached = self.__dict__.get("_misc_cache")
+        if cached is None or cached[0] is not raw:
+            cached = (raw, pickle.loads(bytes(raw)) if raw else {})
+            self.__dict__["_misc_cache"] = cached
+        return cached[1]
+
     @property
     def file_bot_id(self) -> Optional[str]:
         """Bot that can acquire file_id, including legacy author-owned IDs."""
-        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
-        return misc.get("file_bot_id", self.sender_bot_id)
+        return self._misc().get("file_bot_id", self.sender_bot_id)
 
     @property
     def aggregate(self) -> Optional[AggregatePayload]:
-        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
-        aggregate = misc.get("aggregate")
+        aggregate = self._misc().get("aggregate")
         if aggregate is not None and aggregate.get("format_version") != 1:
             raise ValueError("Unsupported live aggregate format.")
         return aggregate
 
     @property
     def source_member(self) -> Optional[SourceMember]:
-        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
-        return misc.get("source_member")
+        return self._misc().get("source_member")
 
     def build_source_member(self, member: SourceMember, chat_manager: ChatObjectCacheManager) -> ETMMsg:
         """Restore a selected real source without treating the container as a source."""
