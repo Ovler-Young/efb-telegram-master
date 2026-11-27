@@ -539,6 +539,27 @@ class DatabaseManager:
                 if field.null and field.column_name not in columns:
                     migrate(migrator.add_column(model._meta.table_name, field.column_name, field))
         self._create_lookup_indexes(database.obj)
+        self._create_unique_association_indexes()
+
+    def _create_unique_association_indexes(self):
+        """Keep one row per chat and per topic, then enforce it with unique indexes.
+
+        Duplicates are removed first: the oldest row wins for a chat link
+        (outbound routing reads it first) and the newest for a topic (inbound
+        routing reads it first). Only the bot's own startup does this, so a
+        database import never sees these indexes.
+        """
+        for model, key, keep, index, columns in (
+            (ChatAssoc, (ChatAssoc.slave_uid,), fn.MIN, "chatassoc_slave_unique", "slave_uid"),
+            (TopicAssoc, (TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id), fn.MAX,
+             "topicassoc_topic_unique", "topic_chat_id, message_thread_id"),
+        ):
+            kept = model.select(keep(model.id)).group_by(*key)
+            deleted = model.delete().where(model.id.not_in(kept)).execute()
+            if deleted:
+                self.logger.warning("Removed %d duplicate rows from %s.", deleted, model._meta.table_name)
+            database.obj.execute_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {model._meta.table_name} ({columns})")
 
     @staticmethod
     def _create_lookup_indexes(db):

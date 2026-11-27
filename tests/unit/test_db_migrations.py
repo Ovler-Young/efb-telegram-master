@@ -27,7 +27,9 @@ from efb_telegram_master.db import (
     TopicAssoc,
     database,
 )
+from efb_telegram_master.db_runtime import connection_scope, current_schema
 from efb_telegram_master.message import ETMMsg
+from tests.unit.test_database_safety import postgres_config, postgres_server_config  # noqa: F401
 from efb_telegram_master.etm_metrics import Metrics
 from efb_telegram_master.msg_type import TGMsgType
 from efb_telegram_master.utils import TelegramChatID, TelegramMessageID, TelegramTopicID
@@ -145,6 +147,65 @@ def test_startup_observes_raw_legacy_rows_without_mutating_them(tmp_path, monkey
     assert "workflows=1 tasks=8" in warnings[0]
     for state in DatabaseManager._LEGACY_OUTBOUND_STATES:
         assert f"{state}=1" in warnings[0]
+
+
+@pytest.fixture(params=["sqlite", "postgresql"] if os.getenv("TEST_POSTGRES_HOST") else ["sqlite"])
+def startup_channel(request, tmp_path, monkeypatch):
+    """A channel to start ``DatabaseManager`` on, once per backend."""
+    monkeypatch.setattr(db_module.utils, "get_data_path", lambda _channel_id: tmp_path)
+    config = {} if request.param == "sqlite" else {"database": request.getfixturevalue("postgres_config")}
+    original_database = database.obj
+    yield SimpleNamespace(channel_id="tests.assoc_unique", config=config)
+    database.initialize(original_database)
+
+
+def test_startup_keeps_one_association_row_per_key_and_adds_unique_indexes(startup_channel):
+    def association_state():
+        schema = current_schema(database.obj)
+        unique = {
+            table: any(
+                index.unique and index.columns == columns
+                for index in database.get_indexes(table, schema=schema)
+            )
+            for table, columns in (
+                ("chatassoc", ["slave_uid"]), ("topicassoc", ["topic_chat_id", "message_thread_id"]),
+            )
+        }
+        return (
+            sorted((row.id, row.master_uid, row.slave_uid) for row in ChatAssoc.select()),
+            sorted((row.id, row.topic_chat_id, row.message_thread_id, row.slave_uid) for row in TopicAssoc.select()),
+            unique,
+        )
+
+    manager = DatabaseManager(startup_channel)
+    try:
+        with connection_scope(database.obj):
+            database.execute_sql("DROP INDEX chatassoc_slave_unique")
+            database.execute_sql("DROP INDEX topicassoc_topic_unique")
+            for master, slave in (("m1", "s1"), ("m2", "s1"), ("m3", "s2")):
+                ChatAssoc.create(master_uid=master, slave_uid=slave)
+            for thread, slave in (("1", "s1"), ("1", "s2"), ("2", "s3")):
+                TopicAssoc.create(topic_chat_id="-100", message_thread_id=thread, slave_uid=slave)
+    finally:
+        manager.stop_worker()
+
+    manager = DatabaseManager(startup_channel)
+    try:
+        with connection_scope(database.obj):
+            first = association_state()
+    finally:
+        manager.stop_worker()
+    chats, topics, unique = first
+    assert [(master, slave) for _, master, slave in chats] == [("m1", "s1"), ("m3", "s2")]
+    assert [(thread, slave) for _, _, thread, slave in topics] == [("1", "s2"), ("2", "s3")]
+    assert unique == {"chatassoc": True, "topicassoc": True}
+
+    manager = DatabaseManager(startup_channel)
+    try:
+        with connection_scope(database.obj):
+            assert association_state() == first
+    finally:
+        manager.stop_worker()
 
 
 def test_relink_forum_binding_moves_chat_and_topic_atomically():
