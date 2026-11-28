@@ -467,6 +467,84 @@ def test_nul_in_content_text_is_replaced_only_on_postgresql(tmp_path, request, m
         assert (info.slave_chat_name, info.slave_chat_alias) == (expected(name), expected(alias))
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_chat_and_topic_links_read_from_memory_match_the_tables_after_every_write(
+        tmp_path, request, manager_factory, backend, caplog):
+    manager = manager_factory(tmp_path, request.getfixturevalue("postgres_config") if backend == "postgresql" else None)
+    masters, slaves, forums = ("m1", "m2", "m3"), ("s1", "s2", "s3", "s4"), (-1001, -1002)
+
+    def assert_reads_match_tables():
+        with connection_scope(manager._managed_database):
+            chat_rows = list(ChatAssoc.select().order_by(ChatAssoc.id))
+            topic_rows = list(TopicAssoc.select().order_by(TopicAssoc.id.desc()))
+
+        def newest_thread(slave, forum):
+            return next((int(row.message_thread_id) for row in topic_rows if row.slave_uid == slave
+                         and (forum is None or row.topic_chat_id == str(forum))), None)
+
+        expected = ([[row.slave_uid for row in chat_rows if row.master_uid == master] for master in masters],
+                    [[row.master_uid for row in chat_rows if row.slave_uid == slave] for slave in slaves],
+                    [newest_thread(slave, forum) for slave in slaves for forum in (*forums, None)])
+        manager.get_chat_assoc(master_uid="m1")  # the first read after a write reloads the links
+        with caplog.at_level("DEBUG", logger="peewee"):
+            caplog.clear()
+            actual = ([manager.get_chat_assoc(master_uid=master) for master in masters],
+                      [manager.get_chat_assoc(slave_uid=slave) for slave in slaves],
+                      [manager.get_topic_thread_id(slave, forum) for slave in slaves for forum in (*forums, None)])
+            assert not [record for record in caplog.records if record.name == "peewee"]
+        assert actual == expected
+
+    assert_reads_match_tables()
+    manager.add_chat_assoc("m1", "s1")
+    manager.add_chat_assoc("m1", "s2", multiple_slave=True)
+    manager.add_chat_assoc("m2", "s3")
+    manager.add_chat_assoc("m3", "s4")
+    manager.add_topic_assoc(forums[0], 10, "s1")
+    manager.add_topic_assoc(forums[0], 11, "s2")
+    manager.add_topic_assoc(forums[1], 12, "s4")
+    assert_reads_match_tables()
+    manager.add_topic_assoc(forums[1], 13, "s1")  # same slave: replaces its topic
+    manager.add_topic_assoc(forums[0], 11, "s3")  # same thread: replaces s2's row
+    assert_reads_match_tables()
+    manager.remove_topic_assoc(topic_chat_id=forums[0], message_thread_id=11)
+    manager.remove_topic_assoc(slave_uid="s4")
+    assert_reads_match_tables()
+
+    add_topic_assoc = manager.add_topic_assoc
+
+    def add_then_read_elsewhere(*args, fail=False):
+        """Write inside the relink transaction, let another thread read the committed rows meanwhile."""
+        add_topic_assoc(*args)
+        reader = threading.Thread(target=manager.get_chat_assoc, kwargs={"master_uid": "m2"})
+        reader.start()
+        reader.join(timeout=10)
+        if fail:
+            raise RuntimeError("relink failed")
+
+    with patch.object(manager, "add_topic_assoc", add_then_read_elsewhere):
+        manager.relink_forum_binding("m2", forums[1], 20, "s2")
+        assert_reads_match_tables()
+        assert manager.get_chat_assoc(master_uid="m2") == ["s3", "s2"]
+        with patch.object(manager, "add_topic_assoc", lambda *args: add_then_read_elsewhere(*args, fail=True)), \
+                pytest.raises(RuntimeError):
+            manager.relink_forum_binding("m3", forums[0], 21, "s1")
+        assert_reads_match_tables()
+        assert manager.get_chat_assoc(slave_uid="s1") == ["m1"]
+
+    manager.remove_chat_assoc(slave_uid="s2")
+    assert_reads_match_tables()
+    manager.remove_chat_assoc(master_uid="m1")
+    assert_reads_match_tables()
+
+    # Databases written before one topic per chat was enforced can hold two rows in one forum: the newer row wins.
+    with connection_scope(manager._managed_database):
+        TopicAssoc.create(topic_chat_id=str(forums[0]), message_thread_id="31", slave_uid="s4")
+        TopicAssoc.create(topic_chat_id=str(forums[0]), message_thread_id="30", slave_uid="s4")
+    manager._drop_assoc_links()
+    assert manager.get_topic_thread_id("s4", forums[0]) == manager.get_topic_thread_id("s4") == 30
+    assert_reads_match_tables()
+
+
 def test_historic_nullable_columns_and_missing_optional_tables(sqlite_source, postgres_config):
     remove_source_columns(sqlite_source, "msglog", ("sender_bot_id", "file_unique_id", "master_msg_id_alt", "pickle", "time"))
     with closing(sqlite3.connect(sqlite_source / "tgdata.db")) as source:
@@ -2049,3 +2127,30 @@ def test_queue_move_keeps_python_memory_bounded_by_bytes(tmp_path, postgres_conf
     assert record["tables"]["outbound_queue"]["rows"] == 97
     # 96 MiB of payloads would go into one 500-row batch; the byte bound splits it.
     assert peak < 32 * 1024 * 1024
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_aggregate_finalize_inserts_only_new_members_and_saves_only_its_columns(
+        sqlite_source, manager_factory, request, backend):
+    from efb_telegram_master.aggregate import make_aggregate, make_source_member
+    from tests.unit.test_live_aggregate import receipt, source
+
+    postgres = request.getfixturevalue("postgres_config") if backend == "postgresql" else None
+    if postgres:
+        migrate_db.migrate(sqlite_source, postgres)
+    manager = manager_factory(sqlite_source, postgres)
+    one, two = (make_source_member(source(uid, f"text {uid}")) for uid in ("one", "two"))
+
+    def finalize(members, revision):
+        with patch.object(db_module.MsgLogMember, "insert_many", wraps=db_module.MsgLogMember.insert_many) as insert:
+            manager.finalize_aggregate_message(receipt(1), make_aggregate(members, revision), "700")
+        return [[row["slave_message_id"] for row in call.args[0]] for call in insert.call_args_list]
+
+    assert finalize([one], 1) == [["one"]]
+    db_module.MsgLog.update(slave_member_uid="kept").where(db_module.MsgLog.master_msg_id == "-100.1").execute()
+    assert finalize([one, two], 2) == [["two"]]
+    assert finalize([one, two], 3) == []
+    row = manager.get_msg_log(master_msg_id="-100.1")
+    assert row.slave_member_uid == "kept"
+    assert row.aggregate["revision"] == 3
+    assert db_module.MsgLogMember.select().count() == 2

@@ -11,7 +11,7 @@ import threading
 from contextlib import nullcontext, suppress
 from enum import Enum
 from functools import wraps
-from typing import Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, Union
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, Union
 
 from peewee import (
     AutoField,
@@ -197,24 +197,30 @@ class MsgLog(BaseModel):
     time = DateTimeField(default=datetime.datetime.now, null=True)
     """Time of the message sent."""
 
+    def _misc(self) -> dict[str, Any]:
+        """Decoded ``pickle``, kept on this row object until ``pickle`` is assigned a new value."""
+        raw = self.pickle
+        cached = self.__dict__.get("_misc_cache")
+        if cached is None or cached[0] is not raw:
+            cached = (raw, pickle.loads(bytes(raw)) if raw else {})
+            self.__dict__["_misc_cache"] = cached
+        return cached[1]
+
     @property
     def file_bot_id(self) -> Optional[str]:
         """Bot that can acquire file_id, including legacy author-owned IDs."""
-        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
-        return misc.get("file_bot_id", self.sender_bot_id)
+        return self._misc().get("file_bot_id", self.sender_bot_id)
 
     @property
     def aggregate(self) -> Optional[AggregatePayload]:
-        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
-        aggregate = misc.get("aggregate")
+        aggregate = self._misc().get("aggregate")
         if aggregate is not None and aggregate.get("format_version") != 1:
             raise ValueError("Unsupported live aggregate format.")
         return aggregate
 
     @property
     def source_member(self) -> Optional[SourceMember]:
-        misc = pickle.loads(bytes(self.pickle)) if self.pickle else {}
-        return misc.get("source_member")
+        return self._misc().get("source_member")
 
     def build_source_member(self, member: SourceMember, chat_manager: ChatObjectCacheManager) -> ETMMsg:
         """Restore a selected real source without treating the container as a source."""
@@ -400,6 +406,10 @@ class DatabaseManager:
         "skipped",
         "dead",
     )
+    # Chat and topic links, read on every message and written only by the methods below.
+    # Loading and dropping take one lock, so a load that read the old rows cannot outlive the drop.
+    _assoc_lock = threading.Lock()
+    _assoc_cache: tuple[dict[str, list[str]], dict[str, list[str]], dict[tuple[str, str | None], str]] | None = None
 
     def __init__(self, channel: 'TelegramChannel'):
         self._metrics: Optional[DatabaseMetrics] = None
@@ -454,6 +464,7 @@ class DatabaseManager:
                     ).where(SlaveChatInfo.slave_chat_group_id.is_null() &
                             SlaveChatInfo.text_aggregation_enabled.is_null(False))
                 }
+                self._assoc_links()
                 self._reclaim_inactive_history_at_startup()
                 self._observe_legacy_outbound_rows()
         except BaseException:
@@ -461,6 +472,28 @@ class DatabaseManager:
             self._data_lock.close()
             raise
         self.logger.debug("Database schema ready; startup never imports SQLite data.")
+
+    def _assoc_links(self):
+        """Return (slaves by master, masters by slave, newest thread by (slave, forum) and by (slave, None))."""
+        with self._assoc_lock:
+            if self._assoc_cache is not None:
+                return self._assoc_cache
+            slaves: dict[str, list[str]] = {}
+            masters: dict[str, list[str]] = {}
+            threads: dict[tuple[str, str | None], str] = {}
+            for row in ChatAssoc.select(ChatAssoc.master_uid, ChatAssoc.slave_uid).order_by(ChatAssoc.id):
+                slaves.setdefault(row.master_uid, []).append(row.slave_uid)
+                masters.setdefault(row.slave_uid, []).append(row.master_uid)
+            for row in TopicAssoc.select(TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id,
+                                         TopicAssoc.slave_uid).order_by(TopicAssoc.id):
+                threads[(row.slave_uid, row.topic_chat_id)] = threads[(row.slave_uid, None)] = row.message_thread_id
+            self._assoc_cache = (slaves, masters, threads)
+            return self._assoc_cache
+
+    def _drop_assoc_links(self) -> None:
+        """Forget the cached links after a write has committed (or failed), so the next read reloads them."""
+        with self._assoc_lock:
+            self._assoc_cache = None
 
     def set_metrics(self, metrics: DatabaseMetrics) -> None:
         """Attach the metrics recorder created after the database manager."""
@@ -512,6 +545,27 @@ class DatabaseManager:
                 if field.null and field.column_name not in columns:
                     migrate(migrator.add_column(model._meta.table_name, field.column_name, field))
         self._create_lookup_indexes(database.obj)
+        self._create_unique_association_indexes()
+
+    def _create_unique_association_indexes(self):
+        """Keep one row per chat and per topic, then enforce it with unique indexes.
+
+        Duplicates are removed first: the oldest row wins for a chat link
+        (outbound routing reads it first) and the newest for a topic (inbound
+        routing reads it first). Only the bot's own startup does this, so the
+        offline import never creates these indexes.
+        """
+        for model, key, keep, index, columns in (
+            (ChatAssoc, (ChatAssoc.slave_uid,), fn.MIN, "chatassoc_slave_unique", "slave_uid"),
+            (TopicAssoc, (TopicAssoc.topic_chat_id, TopicAssoc.message_thread_id), fn.MAX,
+             "topicassoc_topic_unique", "topic_chat_id, message_thread_id"),
+        ):
+            kept = model.select(keep(model.id)).group_by(*key)
+            deleted = model.delete().where(model.id.not_in(kept)).execute()
+            if deleted:
+                self.logger.warning("Removed %d duplicate rows from %s.", deleted, model._meta.table_name)
+            database.obj.execute_sql(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {model._meta.table_name} ({columns})")
 
     @staticmethod
     def _create_lookup_indexes(db):
@@ -642,19 +696,26 @@ class DatabaseManager:
             slave_uid (str): Slave channel UID ("%(channel_id)s.%(chat_id)s")
             multiple_slave: Allow linking to multiple slave channels.
         """
-        if not multiple_slave:
-            self.remove_chat_assoc(master_uid=master_uid)
-        self.remove_chat_assoc(slave_uid=slave_uid)
-        return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
+        try:
+            if not multiple_slave:
+                self.remove_chat_assoc(master_uid=master_uid)
+            self.remove_chat_assoc(slave_uid=slave_uid)
+            return ChatAssoc.create(master_uid=master_uid, slave_uid=slave_uid)
+        finally:
+            self._drop_assoc_links()
 
     @observe_database_method("relink_forum_binding")
     def relink_forum_binding(self, master_uid: EFBChannelChatIDStr,
                               topic_chat_id: TelegramChatID, message_thread_id: TelegramTopicID,
                               slave_uid: EFBChannelChatIDStr):
         """Atomically move one remote chat into a newly-created forum topic."""
-        with database.atomic():
-            self.add_chat_assoc(master_uid, slave_uid, multiple_slave=True)
-            self.add_topic_assoc(topic_chat_id, message_thread_id, slave_uid)
+        try:
+            with database.atomic():
+                self.add_chat_assoc(master_uid, slave_uid, multiple_slave=True)
+                self.add_topic_assoc(topic_chat_id, message_thread_id, slave_uid)
+        finally:
+            # After the commit or the rollback: a read during the transaction may have cached the old rows.
+            self._drop_assoc_links()
 
     @observe_database_method("remove_chat_assoc")
     def remove_chat_assoc(self, master_uid: Optional[EFBChannelChatIDStr] = None,
@@ -685,6 +746,8 @@ class DatabaseManager:
                 return result
         except DoesNotExist:
             return 0
+        finally:
+            self._drop_assoc_links()
 
     @observe_database_method("get_master_msg_id")
     def get_master_msg_id(self, message: EFBMessage, target_chat_id=None, topic=None) -> Optional[TgChatMsgIDStr]:
@@ -760,25 +823,12 @@ class DatabaseManager:
         Returns:
             list: The counterpart ID.
         """
-        try:
-            if bool(master_uid) == bool(slave_uid):
-                raise ValueError("Only one parameter is to be provided.")
-            elif master_uid:
-                slaves = list(
-                    ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
-                    .where(ChatAssoc.master_uid == master_uid)
-                )
-                return [EFBChannelChatIDStr(i.slave_uid) for i in slaves]
-            elif slave_uid:
-                masters = list(
-                    ChatAssoc.select(ChatAssoc.slave_uid, ChatAssoc.master_uid)
-                    .where(ChatAssoc.slave_uid == slave_uid)
-                )
-                return [EFBChannelChatIDStr(i.master_uid) for i in masters]
-            else:
-                return []
-        except DoesNotExist:
-            return []
+        if bool(master_uid) == bool(slave_uid):
+            raise ValueError("Only one parameter is to be provided.")
+        slaves, masters, _ = self._assoc_links()
+        if master_uid:
+            return [EFBChannelChatIDStr(i) for i in slaves.get(str(master_uid), ())]
+        return [EFBChannelChatIDStr(i) for i in masters.get(str(slave_uid), ())]
 
     @observe_database_method("add_topic_assoc")
     def add_topic_assoc(self, topic_chat_id: TelegramChatID,
@@ -793,9 +843,12 @@ class DatabaseManager:
             message_thread_id (EFBChannelChatIDStr): The topic thread ID
             slave_uid (EFBChannelChatIDStr): Slave channel UID ("%(channel_id)s.%(chat_id)s")
         """
-        self.remove_topic_assoc(slave_uid=slave_uid)
-        self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
-        return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
+        try:
+            self.remove_topic_assoc(slave_uid=slave_uid)
+            self.remove_topic_assoc(topic_chat_id=topic_chat_id, message_thread_id=TelegramTopicID(int(message_thread_id)))
+            return TopicAssoc.create(topic_chat_id=topic_chat_id, message_thread_id=message_thread_id, slave_uid=slave_uid)
+        finally:
+            self._drop_assoc_links()
 
     @observe_database_method("get_topic_thread_id")
     def get_topic_thread_id(self, slave_uid: EFBChannelChatIDStr, topic_chat_id: Optional[TelegramChatID] = None) -> Optional[TelegramTopicID]:
@@ -810,20 +863,8 @@ class DatabaseManager:
         Returns:
             The message thread_id
         """
-        try:
-            if topic_chat_id:
-                assoc = TopicAssoc.select(TopicAssoc.message_thread_id)\
-                    .where(TopicAssoc.slave_uid == slave_uid, TopicAssoc.topic_chat_id == topic_chat_id)\
-                    .order_by(TopicAssoc.topic_chat_id.desc()).first()
-            else:
-                assoc = TopicAssoc.select(TopicAssoc.message_thread_id)\
-                    .where(TopicAssoc.slave_uid == slave_uid)\
-                    .order_by(TopicAssoc.topic_chat_id.desc()).first()
-            if assoc:
-                return TelegramTopicID(int(assoc.message_thread_id))
-        except DoesNotExist:
-            pass
-        return None
+        thread = self._assoc_links()[2].get((str(slave_uid), str(topic_chat_id) if topic_chat_id else None))
+        return TelegramTopicID(int(thread)) if thread is not None else None
 
     @observe_database_method("get_topic_chat_id")
     def get_topic_chat_id(self, slave_uid: EFBChannelChatIDStr) -> TelegramChatID | None:
@@ -904,6 +945,8 @@ class DatabaseManager:
                 return TopicAssoc.delete().where(TopicAssoc.slave_uid == slave_uid).execute()
         except DoesNotExist:
             return 0
+        finally:
+            self._drop_assoc_links()
 
     @observe_database_method("add_or_update_message_log")
     def add_or_update_message_log(self,
@@ -1022,6 +1065,7 @@ class DatabaseManager:
             if row and row.sender_bot_id != sender_bot_id:
                 raise ValueError("A live aggregate retains its sending Bot.")
             saved = copy.deepcopy(aggregate)
+            previous_members: Dict[Tuple[str, str], SourceMember] = {}
             if previous:
                 previous_members = {member_identity(member): member for member in previous["children"]}
                 if not set(previous_members).issubset(identities):
@@ -1032,6 +1076,7 @@ class DatabaseManager:
                         # Newer saved routing and removals survive an older receipt snapshot.
                         saved["children"][index] = apply_member_event(old, MemberEvent.RECEIPT, member).member
             first = saved["children"][0]
+            first_insert = row is None
             if row is None:
                 self.add_or_update_message_log(member_message(first), master_message, sender_bot_id=sender_bot_id)
                 row = self._locked_message_log(master_id)
@@ -1041,12 +1086,19 @@ class DatabaseManager:
             misc["aggregate"] = saved
             row.pickle = pickle.dumps(misc, protocol=5)
             row.text = aggregate["confirmed_text"]
+            columns = [MsgLog.pickle, MsgLog.text]
+            if first_insert:
+                columns.append(MsgLog.time)
             topic = getattr(master_message, "message_thread_id", None)
             if topic is not None:
                 row.master_message_thread_id = str(topic)
-            row.save()
-            for member in saved["children"]:
-                self._add_member_mapping(master_id, member)
+                columns.append(MsgLog.master_message_thread_id)
+            row.save(only=columns)
+            new_members = [{"master_msg_id": master_id, "slave_origin_uid": member["origin_uid"],
+                            "slave_message_id": member["source_id"]}
+                           for member in saved["children"] if member_identity(member) not in previous_members]
+            if new_members:
+                MsgLogMember.insert_many(new_members).on_conflict_ignore().execute()
             return row
 
     @observe_database_method("finalize_source_message")
